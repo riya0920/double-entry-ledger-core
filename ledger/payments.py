@@ -31,18 +31,38 @@ CREATE TABLE IF NOT EXISTS payment (
     currency          TEXT NOT NULL,
     authorized_minor  INTEGER NOT NULL,
     captured_minor    INTEGER NOT NULL DEFAULT 0,
+    refunded_minor    INTEGER NOT NULL DEFAULT 0,
+    fee_minor         INTEGER NOT NULL DEFAULT 0,
     state             TEXT NOT NULL CHECK (state IN
-                        ('authorized','partially_captured','captured','voided','refunded')),
+                        ('authorized','partially_captured','captured','voided',
+                         'partially_refunded','refunded')),
     created_at        TEXT NOT NULL
 );
 """
 
-# Transitions this slice implements. Everything absent is unreachable by
-# construction (the guard in _require_state), not by convention.
-ALLOWED = {
+# The complete transition table. Anything not listed here is unreachable, and
+# `_guard` is the single place that enforces it -- so "illegal transitions are
+# impossible" is a property of one dictionary rather than of scattered ifs.
+#
+#                        authorized
+#                       /     |     \
+#                  void   capture   (expiry -- not modelled)
+#                    |       |
+#                 voided  partially_captured -> captured
+#                             |                    |
+#                          refund               refund
+#                             v                    v
+#                    partially_refunded <-> refunded
+ALLOWED: dict[tuple[str, str], tuple[str, ...]] = {
     ("authorized", "capture"): ("partially_captured", "captured"),
     ("partially_captured", "capture"): ("partially_captured", "captured"),
+    ("authorized", "void"): ("voided",),
+    ("captured", "refund"): ("partially_refunded", "refunded"),
+    ("partially_captured", "refund"): ("partially_refunded", "refunded"),
+    ("partially_refunded", "refund"): ("partially_refunded", "refunded"),
 }
+
+TERMINAL = {"voided", "refunded"}
 
 
 class PaymentError(Exception):
@@ -74,8 +94,8 @@ def authorize(ledger: Ledger, payment_id: str, merchant_id: str,
     with ledger.tx() as con:
         con.execute(
             "INSERT INTO payment (id, merchant_id, currency, authorized_minor,"
-            " captured_minor, state, created_at)"
-            " VALUES (?,?,?,?,0,'authorized', datetime('now'))",
+            " captured_minor, refunded_minor, fee_minor, state, created_at)"
+            " VALUES (?,?,?,?,0,0,0,'authorized', datetime('now'))",
             (payment_id, merchant_id, currency, amount_minor))
         txn = ledger.post(
             [debit(HOLD_ASSET, amount_minor, currency),
@@ -96,9 +116,7 @@ def capture(ledger: Ledger, payment_id: str, amount_minor: int,
         row = con.execute("SELECT * FROM payment WHERE id = ?", (payment_id,)).fetchone()
         if row is None:
             raise PaymentError("unknown payment " + payment_id)
-        if (row["state"], "capture") not in ALLOWED:
-            raise PaymentError(
-                "illegal transition: capture from state {!r}".format(row["state"]))
+        _guard(row["state"], "capture")
         remaining = row["authorized_minor"] - row["captured_minor"]
         if not 0 < amount_minor <= remaining:
             raise PaymentError(
@@ -123,6 +141,95 @@ def capture(ledger: Ledger, payment_id: str, amount_minor: int,
 
         captured = row["captured_minor"] + amount_minor
         state = "captured" if captured == row["authorized_minor"] else "partially_captured"
-        con.execute("UPDATE payment SET captured_minor = ?, state = ? WHERE id = ?",
-                    (captured, state, payment_id))
+        con.execute("UPDATE payment SET captured_minor = ?, fee_minor = fee_minor + ?,"
+                    " state = ? WHERE id = ?",
+                    (captured, fee_minor, state, payment_id))
+    return txn
+
+
+def _guard(state: str, action: str) -> None:
+    """The single enforcement point for the transition table.
+
+    Every state change in this module goes through here, which is what makes
+    'illegal transitions are unreachable' checkable by a property test rather
+    than by reading every branch.
+    """
+    if (state, action) not in ALLOWED:
+        raise PaymentError(
+            "illegal transition: cannot {} from state {!r}. Legal actions here: "
+            "{}".format(action, state,
+                        sorted(a for (s, a) in ALLOWED if s == state) or "none (terminal)"))
+
+
+def void(ledger: Ledger, payment_id: str, request_id: str) -> int:
+    """Release an authorization without moving money.
+
+    Void is only legal before any capture. Once funds have moved the correct
+    instrument is a refund, and conflating the two is how a reversal gets booked
+    against a hold that no longer exists.
+    """
+    with ledger.tx() as con:
+        row = con.execute("SELECT * FROM payment WHERE id = ?", (payment_id,)).fetchone()
+        if row is None:
+            raise PaymentError("unknown payment " + payment_id)
+        _guard(row["state"], "void")
+
+        remaining = row["authorized_minor"] - row["captured_minor"]
+        ccy = row["currency"]
+        txn = ledger.post(
+            [debit(HOLD_LIAB, remaining, ccy), credit(HOLD_ASSET, remaining, ccy)],
+            actor="payments-api", reason="void:" + payment_id,
+            request_id=request_id, con=con)
+        con.execute("UPDATE payment SET state = 'voided' WHERE id = ?", (payment_id,))
+    return txn
+
+
+def refund(ledger: Ledger, payment_id: str, amount_minor: int, request_id: str,
+           refund_fee: bool = False) -> int:
+    """Return captured funds to the cardholder.
+
+    A refund is NOT a reversal of the capture entry. The original capture stays
+    in the journal untouched -- it happened -- and the refund posts its own
+    balanced set of entries in the opposite direction. That is the append-only
+    rule applied to the payment layer.
+
+    `refund_fee` models the commercial question every processor has to answer:
+    does the merchant get its processing fee back? Most do not refund it, so the
+    default is False and the fee stays earned. Making it a parameter rather than
+    a hard-coded choice is the point -- it is a pricing decision, not a
+    technical one.
+    """
+    with ledger.tx() as con:
+        row = con.execute("SELECT * FROM payment WHERE id = ?", (payment_id,)).fetchone()
+        if row is None:
+            raise PaymentError("unknown payment " + payment_id)
+        _guard(row["state"], "refund")
+
+        refundable = row["captured_minor"] - row["refunded_minor"]
+        if not 0 < amount_minor <= refundable:
+            raise PaymentError(
+                "refund {} exceeds refundable balance {} (captured {}, already "
+                "refunded {})".format(amount_minor, refundable,
+                                      row["captured_minor"], row["refunded_minor"]))
+
+        ccy = row["currency"]
+        payable = merchant_payable(row["merchant_id"])
+        fee_back = 0
+        if refund_fee and row["captured_minor"]:
+            # Pro-rata share of the fee actually charged on this payment.
+            fee_back = row["fee_minor"] * amount_minor // row["captured_minor"]
+
+        entries = [
+            credit(NETWORK_RECEIVABLE, amount_minor, ccy),
+            debit(payable, amount_minor - fee_back, ccy),
+        ]
+        if fee_back:
+            entries.append(debit(FEE_REVENUE, fee_back, ccy))
+        txn = ledger.post(entries, actor="payments-api",
+                          reason="refund:" + payment_id, request_id=request_id, con=con)
+
+        refunded = row["refunded_minor"] + amount_minor
+        state = "refunded" if refunded == row["captured_minor"] else "partially_refunded"
+        con.execute("UPDATE payment SET refunded_minor = ?, state = ? WHERE id = ?",
+                    (refunded, state, payment_id))
     return txn

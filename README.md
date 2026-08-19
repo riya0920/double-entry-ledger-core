@@ -1,9 +1,10 @@
 # SE-1 — Fintech Core: Double-Entry Ledger + Payment API
 
-**Status: ~20% slice.** The ledger invariants and the idempotency semantics are
-built and proven. The API surface, the full state machine, and the Postgres
-serializable concurrency story are not. Both lists are below, and nothing in the
-"remaining" list is claimed anywhere else in this repo.
+**Status: ~60%.** The ledger invariants, the idempotency semantics, the full
+payment state machine and deterministic FX are built and proven — 40 tests
+including a `hypothesis` stateful model and the complete illegal-transition
+cross-product. The HTTP API and the Postgres serializable concurrency story are
+not. Nothing in the "remaining" list is claimed anywhere else in this repo.
 
 ## The one design decision everything else follows from
 
@@ -69,22 +70,46 @@ this store. Porting to Postgres `SERIALIZABLE` and re-running at 100K/50 workers
 is the first item of remaining work, and the 100K figure in the spec is not
 claimed until that runs.
 
-## What is NOT built (the other 80%)
+## The state machine and FX (added since the first slice)
+
+**Full lifecycle**: `authorize → capture (partial/full) → refund
+(partial/full) | void`, with `voided` and `refunded` terminal. The transition
+table is a single dictionary and `_guard()` is the only enforcement point, which
+is what makes "illegal transitions are unreachable" checkable rather than
+asserted. `test_illegal_transitions_are_unreachable` runs the **entire 6×3
+cross-product** — 18 pairs, 6 legal — and asserts the ledger invariants survive
+each attempt.
+
+A refund is not a reversal of the capture entry. The original capture stays in
+the journal because it happened; the refund posts its own balanced entries in the
+opposite direction. Whether the processing fee is returned is a `refund_fee`
+parameter, not a hard-coded choice — it is a pricing decision, not a technical one.
+
+**FX** (`ledger/fx.py`) turned out to contain the sharpest lesson in this repo: a
+conversion **cannot be two legs**. Debiting a EUR account and crediting a USD one
+leaves both currencies unbalanced and the per-currency seal check rejects it —
+correctly. Money does not teleport between currencies; it is sold into a position
+and bought out of another, so each side balances within its own currency against
+an FX position account. Rounding is half-even (round-half-up accumulates a
+one-directional bias), rates are `str`/`Decimal` and a float raises, and
+`allocate()` splits an amount so the parts sum **exactly** to the whole — pinned
+by a hypothesis property over ±$10M and up to 12 weights.
+
+## What is NOT built
 
 1. **Postgres + SERIALIZABLE** with an explicit retry loop, and the drift test at
-   100K txns / 50 workers on named hardware. Currently SQLite-only.
-2. **HTTP API** (FastAPI + Docker). Everything is a library call today; there is
-   no service, no OpenAPI contract, no p99 latency number.
-3. **State machine completion**: refund (full/partial), void, expiry, and
-   `hypothesis` property tests proving illegal transitions are unreachable. Only
-   `authorize` and `capture` exist; `ALLOWED` in `payments.py` has two rows.
-4. **Multi-currency FX**: per-currency accounts and the balance check are in, but
-   the FX gain/loss account, round-half-even with deterministic remainder
-   assignment, and the "books balance to the cent in every currency" test are not.
+   100K txns / 50 workers on named hardware. Still SQLite-only, so the
+   concurrency proof remains weaker than it looks — see the note above.
+2. **HTTP API** (FastAPI + Docker). Everything is a library call; there is no
+   service, no OpenAPI contract, no p99 latency number.
+3. **Authorization expiry.** `authorize` holds funds forever; real auths expire
+   after 7–30 days and release the hold automatically.
+4. **FX revaluation.** Position accounts accumulate exposure but are never
+   revalued at a period-end rate, so unrealised FX P&L is not recognised.
 5. **Floors as a DB trigger** rather than an in-transaction Python check.
 6. **Testcontainers integration tests** and CI wiring.
-7. Snapshotting for `balance_as_of` (today it is a full journal scan — fine at
-   this size, wrong at scale).
+7. Snapshotting for `balance_as_of` (today a full journal scan — fine at this
+   size, wrong at scale).
 
 ## Run it
 
