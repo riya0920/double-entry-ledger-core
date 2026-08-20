@@ -5,8 +5,9 @@ authorization creates an obligation, not a transfer, so it posts into a holds
 account pair and leaves the merchant payable untouched. Capture is what moves
 money, and it releases exactly the captured slice of the hold.
 
-Scope of this 20% slice: authorize + capture (full and partial).
-refund / void / the full property-tested state machine are the remaining 80%.
+Full lifecycle: authorize, capture (partial and full), refund (partial and
+full), void, and expiry. The transition table below is the whole specification
+and `_guard` is its only enforcement point.
 
 Chart of accounts used here (acquirer's books):
   holds:auth_receivable     asset      claim on the issuer for authorized funds
@@ -35,7 +36,7 @@ CREATE TABLE IF NOT EXISTS payment (
     fee_minor         INTEGER NOT NULL DEFAULT 0,
     state             TEXT NOT NULL CHECK (state IN
                         ('authorized','partially_captured','captured','voided',
-                         'partially_refunded','refunded')),
+                         'partially_refunded','refunded','expired')),
     created_at        TEXT NOT NULL
 );
 """
@@ -62,7 +63,7 @@ ALLOWED: dict[tuple[str, str], tuple[str, ...]] = {
     ("partially_refunded", "refund"): ("partially_refunded", "refunded"),
 }
 
-TERMINAL = {"voided", "refunded"}
+TERMINAL = {"voided", "refunded", "expired"}
 
 
 class PaymentError(Exception):

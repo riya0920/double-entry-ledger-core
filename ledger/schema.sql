@@ -143,3 +143,58 @@ WHEN NEW.sealed = 1 AND OLD.sealed = 0
 BEGIN
     SELECT RAISE(ABORT, 'cannot seal a transaction with no entries');
 END;
+
+-- ---------------------------------------------------------- floor as a trigger
+-- Invariant I2 was enforced by a Python check inside the write transaction.
+-- That is correct as long as every writer goes through core.post(), which is a
+-- guarantee about code rather than about data. In the database it holds for any
+-- writer, including a DBA at a prompt at 2am.
+--
+-- The check runs at SEAL, not per entry, for two reasons:
+--
+--   CORRECTNESS. A floor is a property of a completed transaction, not of an
+--   individual leg. A transaction that debits an account below its floor and
+--   credits it back within the same balanced set never leaves the account
+--   overdrawn, and a per-entry check would reject it depending on the order the
+--   legs happen to be inserted in.
+--
+--   DETERMINISM. SQLite does not define the firing order of multiple AFTER
+--   INSERT triggers on one table. A per-entry floor check that reads
+--   account_balance therefore races entry_after_insert, which is the trigger
+--   that maintains it -- and a check that silently passes because it ran first
+--   is worse than no check. An earlier version of this file had exactly that
+--   bug: the trigger existed, the test asserted it fired, and it did not.
+CREATE TRIGGER IF NOT EXISTS txn_seal_respects_floors
+BEFORE UPDATE OF sealed ON journal_txn
+WHEN NEW.sealed = 1 AND OLD.sealed = 0
+ AND EXISTS (
+     SELECT 1
+       FROM account a
+       JOIN account_balance b ON b.account_id = a.id
+      WHERE a.overdraft_allowed = 0
+        AND b.balance_minor < a.floor_minor
+        AND a.id IN (SELECT account_id FROM journal_entry WHERE txn_id = NEW.id)
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'floor breach: account balance below its floor at seal');
+END;
+
+-- ------------------------------------------------------------------ snapshots
+-- balance_as_of() scans the whole journal, which is fine at this size and wrong
+-- at scale. A snapshot is a checkpoint: the balance at a point in time, so an
+-- as-of query reads the latest snapshot at or before the target and replays only
+-- the entries after it.
+--
+-- Snapshots are DERIVED and disposable. Deleting every row here changes no
+-- answer, only the time taken to compute it -- which is the property that makes
+-- a cache safe. If a snapshot could change an answer it would be a second source
+-- of truth, and the journal would no longer be the ledger.
+CREATE TABLE IF NOT EXISTS balance_snapshot (
+    account_id    TEXT NOT NULL REFERENCES account(id),
+    as_of         TEXT NOT NULL,
+    balance_minor INTEGER NOT NULL,
+    last_txn_id   INTEGER NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (account_id, as_of)
+);
+CREATE INDEX IF NOT EXISTS ix_snapshot_account ON balance_snapshot(account_id, as_of);

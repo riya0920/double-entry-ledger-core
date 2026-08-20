@@ -1,10 +1,17 @@
 # SE-1 — Fintech Core: Double-Entry Ledger + Payment API
 
-**Status: ~60%.** The ledger invariants, the idempotency semantics, the full
-payment state machine and deterministic FX are built and proven — 40 tests
-including a `hypothesis` stateful model and the complete illegal-transition
-cross-product. The HTTP API and the Postgres serializable concurrency story are
-not. Nothing in the "remaining" list is claimed anywhere else in this repo.
+**Status: ~85%.** Ledger invariants (now enforced by database trigger, not only
+by application code), idempotency exercised over HTTP, the full payment lifecycle
+including expiry, deterministic FX with period-end revaluation, and balance
+snapshots — **66 tests**, including a `hypothesis` stateful model and the complete
+illegal-transition cross-product. The Postgres serializable story is the main
+thing still missing, and nothing in the "remaining" list is claimed anywhere else.
+
+```bash
+python -m pytest tests -q              # 66 tests
+python drift_test.py --txns 8000       # four-invariant concurrency drill
+uvicorn serve:app --port 8100          # HTTP API
+```
 
 ## The one design decision everything else follows from
 
