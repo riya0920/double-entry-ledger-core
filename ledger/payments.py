@@ -88,11 +88,19 @@ def merchant_payable(merchant_id: str) -> str:
 
 
 def authorize(ledger: Ledger, payment_id: str, merchant_id: str,
-              amount_minor: int, currency: str, request_id: str) -> int:
-    """Record a hold. No merchant balance changes -- that is the whole point."""
+              amount_minor: int, currency: str, request_id: str,
+              idempotency_key: str | None = None) -> int:
+    """Record a hold. No merchant balance changes -- that is the whole point.
+
+    With `idempotency_key`, the payment row, the journal entries AND the stored
+    response all commit together, so a client that times out and retries gets
+    the original answer instead of a second hold. Without it the call behaves
+    as it always did, which is what the library-level tests exercise.
+    """
     if amount_minor <= 0:
         raise PaymentError("authorization must be positive")
-    with ledger.tx() as con:
+
+    def work(con):
         con.execute(
             "INSERT INTO payment (id, merchant_id, currency, authorized_minor,"
             " captured_minor, refunded_minor, fee_minor, state, created_at)"
@@ -103,7 +111,17 @@ def authorize(ledger: Ledger, payment_id: str, merchant_id: str,
              credit(HOLD_LIAB, amount_minor, currency)],
             actor="payments-api", reason="authorize:" + payment_id,
             request_id=request_id, con=con)
-    return txn
+        return {"txn_id": txn, "payment_id": payment_id, "state": "authorized"}
+
+    if idempotency_key is None:
+        with ledger.tx() as con:
+            return work(con)["txn_id"]
+
+    payload = {"op": "authorize", "payment_id": payment_id,
+               "merchant_id": merchant_id, "amount_minor": amount_minor,
+               "currency": currency}
+    body, _, _ = ledger.run_idempotent(idempotency_key, payload, work)
+    return int(body["txn_id"])
 
 
 def capture(ledger: Ledger, payment_id: str, amount_minor: int,

@@ -169,6 +169,48 @@ class Ledger:
         blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(blob).hexdigest()
 
+    def run_idempotent(self, key: str, payload: dict, work, *,
+                       status_code: int = 201) -> tuple[dict, int, bool]:
+        """Any unit of work made replay-safe. `work(con) -> response body`.
+
+        `post_idempotent` below does this for a bare posting. Payments need the
+        same protection over MORE than a posting -- authorize also inserts a
+        payment row, capture also advances a state machine -- and wrapping only
+        the posting would leave the rest of the write outside the guarantee.
+
+        This is the generalisation, and it exists because `run_api_load.py`
+        found the gap: 3,200 authorizes over HTTP produced **0 idempotency
+        keys**. The endpoint was not idempotent at all, so a client that timed
+        out and retried placed a SECOND hold on the card. The repository's
+        headline idempotency property was real and was being demonstrated on a
+        path the payments API did not use.
+        """
+        h = self.payload_hash(payload)
+        existing = self._lookup_key(key)
+        if existing is not None:
+            return self._replay(existing, h)
+
+        try:
+            with self.tx() as con:
+                body = work(con)
+                con.execute(
+                    "INSERT INTO idempotency_key (key, payload_hash, response_json,"
+                    " status_code, txn_id, created_at) VALUES (?,?,?,?,?,?)",
+                    (key, h, json.dumps(body), status_code,
+                     body.get("txn_id"), utcnow()))
+        except sqlite3.IntegrityError:
+            # Concurrent duplicate -- OR a genuine constraint violation inside
+            # `work`, such as a duplicate payment id. Those are different
+            # failures and must not be conflated: if the key is absent the
+            # integrity error came from the work, and re-raising is the only
+            # honest answer.
+            existing = self._lookup_key(key)
+            if existing is None:
+                raise
+            return self._replay(existing, h)
+
+        return body, status_code, False
+
     def post_idempotent(self, key: str, payload: dict, entries: Sequence[Entry],
                         actor: str, reason: str, request_id: str,
                         crash_after_commit=None) -> tuple[dict, int, bool]:

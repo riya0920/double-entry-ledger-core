@@ -157,14 +157,35 @@ def create_posting(response: Response, body: PostingIn = Body(...),
 
 
 @app.post("/payments/authorize", status_code=201)
-def api_authorize(body: AuthorizeIn) -> dict:
+def api_authorize(body: AuthorizeIn,
+                  idempotency_key: str | None = Header(
+                      default=None, alias="Idempotency-Key")) -> dict:
+    """Authorize a payment. Send `Idempotency-Key` and a retry replays.
+
+    This endpoint used to pass a request id straight through to `ledger.post`,
+    which records the id on the journal row and creates NO idempotency record.
+    `run_api_load.py` made that visible: 3,200 authorizes over HTTP produced
+    3,200 journal transactions and **0 idempotency keys**, so a client that
+    timed out and retried placed a second hold on the card. The repository's
+    idempotency guarantee was real and was being demonstrated on a code path
+    the payments API did not take.
+
+    The key defaults to the payment id when the header is absent, because for
+    an authorize the payment id already IS the natural idempotency key -- and a
+    default that protects the caller beats a default that quietly does not.
+    """
     lg = _ledger()
+    key = idempotency_key or "auth:" + body.payment_id
     try:
         txn = authorize(lg, body.payment_id, body.merchant_id,
                         body.amount_minor, body.currency,
-                        "req-" + body.payment_id)
+                        "req-" + body.payment_id, idempotency_key=key)
     except PaymentError as exc:
         raise HTTPException(422, str(exc))
+    except IdempotencyConflict as exc:
+        # Same key, DIFFERENT payload. Returning the first caller's result here
+        # would tell caller two that its different request succeeded.
+        raise HTTPException(409, str(exc))
     except Exception as exc:
         raise HTTPException(409, str(exc))
     return {"payment_id": body.payment_id, "txn_id": txn, "state": "authorized"}

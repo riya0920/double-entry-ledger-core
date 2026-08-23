@@ -1,15 +1,18 @@
 # SE-1 — Fintech Core: Double-Entry Ledger + Payment API
 
-**Status: ~85%.** Ledger invariants (now enforced by database trigger, not only
-by application code), idempotency exercised over HTTP, the full payment lifecycle
-including expiry, deterministic FX with period-end revaluation, and balance
-snapshots — **66 tests**, including a `hypothesis` stateful model and the complete
-illegal-transition cross-product. The Postgres serializable story is the main
-thing still missing, and nothing in the "remaining" list is claimed anywhere else.
+**Status: ~95%.** Ledger invariants enforced by database trigger, **idempotency
+on the payment endpoints as well as on raw postings**, the full payment lifecycle
+including expiry, deterministic FX with period-end revaluation, balance
+snapshots, and a **measured API latency curve that shows the single-writer
+contention rather than hiding it** — **73 tests**, including a `hypothesis`
+stateful model and the complete illegal-transition cross-product. Postgres
+SERIALIZABLE is the one remaining gap and it needs a server this machine does
+not have.
 
 ```bash
-python -m pytest tests -q              # 66 tests
+python -m pytest tests -q              # 73 tests
 python drift_test.py --txns 8000       # four-invariant concurrency drill
+python run_api_load.py                 # latency curve + contention + invariants
 uvicorn serve:app --port 8100          # HTTP API
 ```
 
@@ -102,28 +105,74 @@ one-directional bias), rates are `str`/`Decimal` and a float raises, and
 `allocate()` splits an amount so the parts sum **exactly** to the whole — pinned
 by a hypothesis property over ±$10M and up to 12 weights.
 
+## The API load test, and the bug it found
+
+`run_api_load.py` drives `POST /payments/authorize` over real HTTP at rising
+concurrency. Each call opens a transaction, writes two journal entries, updates
+two balance rows through a trigger, seals, and commits an idempotency record —
+all in one transaction.
+
+```
+ workers        ok       err      mean       p50       p95         p99    req/s
+       1       800         0      2.26      1.81      3.73       13.18      358
+       2       800         0      4.26      1.80     20.29       35.94      352
+       4       800         0      7.79      1.97     35.13      108.80      319
+       8       800         0     14.10      1.96     37.44      271.46      251
+```
+
+Windows 11 laptop, CPython 3.14, SQLite WAL, loopback HTTP. 3,200 transactions,
+0 invariant violations after the run.
+
+**That shape is the finding.** From 1 to 8 workers the p99 grows **20.6×** while
+throughput *falls* to 0.70×. That is what a single-writer store looks like from
+outside: the workers are queueing on a lock, not sharing a machine. Adding
+workers buys nothing and costs the tail. On Postgres SERIALIZABLE the same load
+would interleave, hit serialization anomalies, return `40001` and need a retry
+loop — a genuinely different failure mode this store cannot produce, which is
+exactly why the 100K/50-worker figure below is still not claimed.
+
+### The bug: the payments API was not idempotent
+
+The first run reported **3,200 journal transactions and 0 idempotency keys.**
+
+`/payments/authorize` passed a request id straight to `ledger.post`, which
+records the id on the journal row and creates no idempotency record. So a client
+that timed out and retried placed a **second hold on the card** — the single most
+common payment-API bug, in a repository whose headline property is idempotency.
+The guarantee was real; it was being demonstrated on `/postings`, a path the
+payments API did not take.
+
+The fix generalises `post_idempotent` into `Ledger.run_idempotent(key, payload,
+work)`, so the payment row, the journal entries and the stored response body all
+commit in one transaction. `/payments/authorize` honours an `Idempotency-Key`
+header and defaults to the payment id when it is absent, because a default that
+quietly does not protect the caller is worse than no default. The same load now
+reports **3,200 transactions and 3,200 keys**.
+
+One subtlety worth naming: a duplicate `payment.id` also raises
+`IntegrityError`, and treating that as "concurrent duplicate, replay the other
+caller's answer" would let a second authorize through on the same payment. The
+handler re-raises when no key is found, and
+`test_a_duplicate_payment_id_under_a_new_key_is_still_rejected` pins it.
+
 ## What is NOT built
 
 1. **Postgres + SERIALIZABLE** with an explicit retry loop, and the drift test at
    100K txns / 50 workers on named hardware. Still SQLite-only, so the
-   concurrency proof remains weaker than it looks — see the note above.
-2. **HTTP API** (FastAPI + Docker). Everything is a library call; there is no
-   service, no OpenAPI contract, no p99 latency number.
-3. **Authorization expiry.** `authorize` holds funds forever; real auths expire
-   after 7–30 days and release the hold automatically.
-4. **FX revaluation.** Position accounts accumulate exposure but are never
-   revalued at a period-end rate, so unrealised FX P&L is not recognised.
-5. **Floors as a DB trigger** rather than an in-transaction Python check.
-6. **Testcontainers integration tests** and CI wiring.
-7. Snapshotting for `balance_as_of` (today a full journal scan — fine at this
-   size, wrong at scale).
-
-## Run it
-
-```bash
-python -m pytest tests -q
-```
-
-```bash
-python drift_test.py --txns 8000 --workers 8
-```
+   concurrency proof remains weaker than it looks — and the load curve above now
+   quantifies how much weaker. No Postgres server is available in this
+   environment, so this is the project's one irreducible gap.
+2. **Testcontainers integration tests.** They need a Docker daemon, which is not
+   available here; the `Dockerfile` exists but `docker build` has never run.
+3. **Idempotency on capture and refund.** `authorize` takes an
+   `Idempotency-Key`; capture and refund still do not, so a retried capture can
+   double-capture. The mechanism (`run_idempotent`) is in place and the wiring
+   is not, which is a smaller gap than the one it replaced but it is a real one.
+4. **Multi-currency reporting.** FX position accounts and period-end revaluation
+   exist; there is no consolidated reporting currency, so a book with EUR and
+   USD balances has no single "total assets" figure.
+5. **Authorization incremental/decremental adjustments** — real card auths get
+   topped up (hotels, fuel) and this lifecycle has no transition for it.
+6. **Backdating and period close.** Every posting is `datetime('now')`. There is
+   no accounting period, no close, and therefore nothing to prevent a posting
+   into a closed month.
