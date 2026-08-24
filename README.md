@@ -1,6 +1,6 @@
 # SE-1 — Fintech Core: Double-Entry Ledger + Payment API
 
-**Status: ~99%.** Ledger invariants enforced by database trigger, **idempotency
+**Status: ~97%.** Ledger invariants enforced by database trigger, **idempotency
 on the payment endpoints as well as on raw postings**, the full payment lifecycle
 including expiry, deterministic FX with period-end revaluation, balance
 snapshots, and a **measured API latency curve that shows the single-writer
