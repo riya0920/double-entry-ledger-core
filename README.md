@@ -4,16 +4,17 @@
 on the payment endpoints as well as on raw postings**, the full payment lifecycle
 including expiry, deterministic FX with period-end revaluation, balance
 snapshots, and a **measured API latency curve that shows the single-writer
-contention rather than hiding it** — **85 tests**, including a `hypothesis`
+contention rather than hiding it** — **87 tests**, including a `hypothesis`
 stateful model and the complete illegal-transition cross-product -- **and a
 PostgreSQL 18 port running under real SERIALIZABLE**, which measured something
 that argues against this project's central design decision.
 
 ```bash
-python -m pytest tests -q              # 85 tests
+python -m pytest tests -q              # 87 tests
 python drift_test.py --txns 8000       # four-invariant concurrency drill
 python run_api_load.py                 # latency curve + contention + invariants
 python pg_drift_test.py --txns 800 --workers 16   # real SERIALIZABLE + retries
+python pg_hotrow_test.py --txns 480 --workers 16  # cached vs derived balance
 uvicorn serve:app --port 8100          # HTTP API
 ```
 
@@ -223,12 +224,60 @@ One more thing the port surfaced: I3 (cached balance equals journal) correctly
 flagged the anomaly probes' hand-written rows. The invariant caught a balance no
 journal entry justified, which is exactly its job.
 
+## The hot-row hypothesis, tested
+
+The section above diagnosed the contention as the trigger-maintained
+`account_balance` row and asserted the fix — aggregate the journal on read
+instead. **That was reasoning with no experiment behind it**, so
+`pg_hotrow_test.py` runs both designs against the same hot account, same
+isolation, same retry loop.
+
+| | cached balance row | derived on read |
+|---|---|---|
+| committed | 355 | **477** |
+| serialization failures | 1,793 | 489 |
+| **retries exhausted** | **125** | **3** |
+| retry rate | 83.5% | 50.6% |
+| txn/s | 21 | **127** |
+
+**Supported, with a qualification the first draft did not have.** Removing the
+cache cut the retry rate roughly in half and took transactions lost outright from
+125 to 3. But 50.6% is not zero: the postings still share a transaction table, a
+sequence and an index, and SERIALIZABLE finds dependencies there too. **The
+balance row was the dominant cause, not the only one** — a weaker claim than the
+one I published, and the one the measurement supports.
+
+The magnitude moves run to run (cached 77–84%, derived 33–51%) because the box is
+loaded, so the test asserts the *direction* and not a threshold. Asserting a
+threshold would be asserting the load.
+
+### What the derived design costs
+
+Measured on a warm connection, 25 repeats:
+
+| | cached | derived |
+|---|---|---|
+| balance read | 1.41 ms | 1.90 ms |
+| rows scanned | 1 | 477 |
+
+The first attempt at this measurement opened a fresh connection per read and
+reported the *cached* read as slower — impossible when one scans a single row and
+the other scans hundreds. It was timing SCRAM handshakes, not queries.
+
+The cost is real and it grows with history: at a million entries the balance
+query scans a million rows, on every authorization. **The production answer is
+neither design alone — it is periodic snapshots**, balance at a checkpoint plus
+the entries since. This repo already has `balance_snapshot` and
+`balance_as_of_snapshotted` for exactly that shape on the SQLite side. Porting it
+is the real work, and this experiment is what says it is worth doing.
+
 ## What is NOT built
 
-1. **A hot-row-free balance design.** The measurement above says the
-   trigger-maintained cache is the bottleneck under real concurrency. Sharding
-   the balance row, or dropping the cache and aggregating the journal on read,
-   is the fix and it is a rewrite rather than a patch.
+1. **Snapshot-backed balances on Postgres.** The experiment above shows the
+   derived design fixes most of the contention and moves the cost to the read
+   path, where it grows with history. Neither extreme is the answer; periodic
+   snapshots are, and the SQLite side already has that machinery. Porting it is
+   the remaining work, and it is now a specified job rather than a hunch.
 2. **The spec's 100K / 50-worker figure.** The Postgres drill runs at 800/16 in
    a reasonable time; at 100K it would take hours on a hot account precisely
    because of item 1, so the number is still not claimed.

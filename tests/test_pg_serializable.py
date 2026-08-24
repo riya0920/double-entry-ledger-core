@@ -269,3 +269,84 @@ def test_i3_catches_a_balance_no_journal_entry_justifies(led):
     flagged = [p for p in led.check_invariants()
                if p.startswith("I3") and ":probe" in p]
     assert flagged, "I3 did not notice a hand-written balance"
+
+
+# --------------------------------------------------- the hot-row experiment
+def test_the_derived_design_conflicts_less_than_the_cached_one(led):
+    """The hypothesis pg_drift_test.py raised, as an assertion.
+
+    The README claimed the trigger-maintained balance row was what made
+    SERIALIZABLE fail on a hot account. This pins the direction of the effect
+    without pinning a magnitude -- the machine is loaded and the retry rate
+    moves run to run (cached 77-84%, derived 33-51% across runs), so asserting
+    a threshold would be asserting the load.
+    """
+    import threading
+
+    from ledger.pg_nohotrow import DerivedLedger
+
+    def run(make, stats):
+        def work(w):
+            lg = make(stats)
+            for i in range(12):
+                try:
+                    lg.post([{"account_id": CASH, "direction": "D",
+                              "amount_minor": 100 + i, "currency": "USD"},
+                             {"account_id": REV, "direction": "C",
+                              "amount_minor": 100 + i, "currency": "USD"}],
+                            "t", "hot", "r-{}-{}".format(w, i))
+                except Exception:                            # noqa: BLE001
+                    pass
+            (getattr(lg, "close", None) or lg.base.close)()
+
+        ts = [threading.Thread(target=work, args=(w,)) for w in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+
+    base = PgLedger(DSN)
+    base.install_schema()
+    for acct, kind in ((REV, "revenue"), (CASH, "asset")):
+        base.open_account(acct, kind, "USD", floor_minor=-10**15,
+                          overdraft_allowed=True)
+    base.close()
+    cached = RetryStats()
+    run(lambda st: PgLedger(DSN, stats=st), cached)
+
+    d = DerivedLedger(PgLedger(DSN))
+    d.install_schema()
+    for acct, kind in ((REV, "revenue"), (CASH, "asset")):
+        d.open_account(acct, kind, "USD", floor_minor=-10**15,
+                       overdraft_allowed=True)
+    d.base.close()
+    derived = RetryStats()
+    run(lambda st: DerivedLedger(PgLedger(DSN, stats=st)), derived)
+
+    assert derived.retry_rate < cached.retry_rate, (
+        "derived {:.1%} vs cached {:.1%}".format(
+            derived.retry_rate, cached.retry_rate))
+    assert derived.exhausted <= cached.exhausted
+
+
+def test_the_derived_ledger_is_still_append_only(led):
+    """Dropping the cache must not drop the invariant. Corrections stay
+    reversing entries."""
+    from ledger.pg_nohotrow import DerivedLedger
+
+    d = DerivedLedger(PgLedger(DSN))
+    d.install_schema()
+    for acct, kind in ((REV, "revenue"), (CASH, "asset")):
+        d.open_account(acct, kind, "USD", floor_minor=-10**15,
+                       overdraft_allowed=True)
+    txn = d.post([{"account_id": CASH, "direction": "D",
+                   "amount_minor": 500, "currency": "USD"},
+                  {"account_id": REV, "direction": "C",
+                   "amount_minor": 500, "currency": "USD"}],
+                 "t", "sale", "r-append-d")
+    with psycopg.connect(DSN, autocommit=True) as c:
+        with pytest.raises(psycopg.errors.RaiseException):
+            c.execute("UPDATE d_journal_entry SET amount_minor = 1"
+                      " WHERE txn_id = %s", (txn,))
+    assert d.balance(CASH) == 500
+    d.base.close()
