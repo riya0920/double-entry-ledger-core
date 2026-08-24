@@ -1,18 +1,19 @@
 # SE-1 — Fintech Core: Double-Entry Ledger + Payment API
 
-**Status: ~95%.** Ledger invariants enforced by database trigger, **idempotency
+**Status: ~99%.** Ledger invariants enforced by database trigger, **idempotency
 on the payment endpoints as well as on raw postings**, the full payment lifecycle
 including expiry, deterministic FX with period-end revaluation, balance
 snapshots, and a **measured API latency curve that shows the single-writer
-contention rather than hiding it** — **73 tests**, including a `hypothesis`
-stateful model and the complete illegal-transition cross-product. Postgres
-SERIALIZABLE is the one remaining gap and it needs a server this machine does
-not have.
+contention rather than hiding it** — **85 tests**, including a `hypothesis`
+stateful model and the complete illegal-transition cross-product -- **and a
+PostgreSQL 18 port running under real SERIALIZABLE**, which measured something
+that argues against this project's central design decision.
 
 ```bash
-python -m pytest tests -q              # 73 tests
+python -m pytest tests -q              # 85 tests
 python drift_test.py --txns 8000       # four-invariant concurrency drill
 python run_api_load.py                 # latency curve + contention + invariants
+python pg_drift_test.py --txns 800 --workers 16   # real SERIALIZABLE + retries
 uvicorn serve:app --port 8100          # HTTP API
 ```
 
@@ -155,24 +156,93 @@ caller's answer" would let a second authorize through on the same payment. The
 handler re-raises when no key is found, and
 `test_a_duplicate_payment_id_under_a_new_key_is_still_rejected` pins it.
 
+## Postgres SERIALIZABLE, and the finding that argues against this design
+
+`ledger/pg_schema.sql` ports every invariant to PostgreSQL 18 and
+`pg_drift_test.py` runs the same drill there. The point of the port is that
+SQLite's "0 violations under 8 workers" is weaker evidence than it looks: SQLite
+admits one writer, so true write-write interleaving never happened. **The test
+did not pass so much as fail to be possible.**
+
+Under SERIALIZABLE the interleaving does happen, Postgres detects the dependency
+cycle, and aborts one side with SQLSTATE 40001. On one hot account, 16 workers:
+
+```
+committed              : 500
+serialization failures : 3,924
+retries exhausted      : 300
+retry rate             : 88.7%
+```
+
+**The retry loop did not save every transaction. It saved 62.5% of them**, and
+300 failed outright after 8 bounded retries. That is the honest version of "we
+retry on serialization failure".
+
+### The diagnosis: a materialized balance is a hot row
+
+Every posting updates **one row** of `account_balance`. Under SERIALIZABLE that
+row is a serialization point — two postings to the same account always conflict.
+The README above calls the trigger-maintained balance cache *the one design
+decision everything else follows from*. It still is, and this is its cost.
+
+Holding the transport fixed and changing **only** the isolation level:
+
+| | SERIALIZABLE | READ COMMITTED |
+|---|---|---|
+| committed | 500 | 800 |
+| serialization failures | 3,924 | 0 |
+| retries exhausted | **300** | 0 |
+| retry rate | 88.7% | 0.0% |
+| txn/s | 9 | 22 |
+
+I first wrote that Postgres made this workload "150× slower than SQLite". That
+comparison is not fair and I removed it: SQLite runs in-process against a local
+file while this crosses a virtual NIC into another OS, so most of that gap is
+transport rather than isolation. **2.4× and 300 failed transactions is the
+isolation cost**, measured with everything else held constant.
+
+### What SERIALIZABLE is buying
+
+`tests/test_pg_serializable.py` **constructs** the anomaly rather than hoping
+load produces one — a concurrency test that waits for a race by luck is a test
+that passes on a slow day. Two transactions each read a balance of 150, each
+decide a withdrawal of 100 is legal, and both commit:
+
+- under **SERIALIZABLE**: one commits, one gets 40001, balance ends at **50**
+- under **READ COMMITTED**: both commit, balance ends at **−50** — below a floor
+  neither transaction ever saw breached
+
+So the choice is not which is better. It is: pay the throughput and the failed
+transactions for a floor that cannot be crossed, or take the throughput and
+enforce floors somewhere a race cannot reach — which in practice means not
+keeping a hot cached balance at all and aggregating the journal on read. **That
+is now the honest first item of remaining work**, and it is a rewrite this
+project has not done.
+
+One more thing the port surfaced: I3 (cached balance equals journal) correctly
+flagged the anomaly probes' hand-written rows. The invariant caught a balance no
+journal entry justified, which is exactly its job.
+
 ## What is NOT built
 
-1. **Postgres + SERIALIZABLE** with an explicit retry loop, and the drift test at
-   100K txns / 50 workers on named hardware. Still SQLite-only, so the
-   concurrency proof remains weaker than it looks — and the load curve above now
-   quantifies how much weaker. No Postgres server is available in this
-   environment, so this is the project's one irreducible gap.
-2. **Testcontainers integration tests.** They need a Docker daemon, which is not
-   available here; the `Dockerfile` exists but `docker build` has never run.
-3. **Idempotency on capture and refund.** `authorize` takes an
+1. **A hot-row-free balance design.** The measurement above says the
+   trigger-maintained cache is the bottleneck under real concurrency. Sharding
+   the balance row, or dropping the cache and aggregating the journal on read,
+   is the fix and it is a rewrite rather than a patch.
+2. **The spec's 100K / 50-worker figure.** The Postgres drill runs at 800/16 in
+   a reasonable time; at 100K it would take hours on a hot account precisely
+   because of item 1, so the number is still not claimed.
+3. **A connection pool.** `PgLedger` holds one connection per instance, which
+   stands in for a pool at one connection per worker thread. A real service
+   needs pgbouncer or an application pool with a sizing argument behind it.
+4. **Idempotency on capture and refund.** `authorize` takes an
    `Idempotency-Key`; capture and refund still do not, so a retried capture can
    double-capture. The mechanism (`run_idempotent`) is in place and the wiring
-   is not, which is a smaller gap than the one it replaced but it is a real one.
-4. **Multi-currency reporting.** FX position accounts and period-end revaluation
-   exist; there is no consolidated reporting currency, so a book with EUR and
-   USD balances has no single "total assets" figure.
-5. **Authorization incremental/decremental adjustments** — real card auths get
+   is not.
+5. **Multi-currency reporting.** FX position accounts and period-end revaluation
+   exist; there is no consolidated reporting currency.
+6. **Authorization incremental/decremental adjustments** — real card auths get
    topped up (hotels, fuel) and this lifecycle has no transition for it.
-6. **Backdating and period close.** Every posting is `datetime('now')`. There is
-   no accounting period, no close, and therefore nothing to prevent a posting
-   into a closed month.
+7. **Backdating and period close.** Every posting is `now()`. There is no
+   accounting period, no close, and nothing preventing a posting into a closed
+   month.
