@@ -24,12 +24,29 @@ from ledger.pg_store import (DSN, PgLedger, RetryStats, SerializationExhausted,
 
 
 def _reachable():
-    try:
-        with psycopg.connect(DSN, connect_timeout=3) as c:
-            c.execute("select 1")
-        return True
-    except Exception:                                        # noqa: BLE001
-        return False
+    """Generous timeout on purpose.
+
+    A 3-second probe reported "no Postgres" against a server that was up and
+    still warming its first connection, so fourteen tests skipped silently and
+    the suite reported green. A skip that looks like a pass is the worst
+    outcome available to a conditional test.
+    """
+    import time
+
+    # Retry, because the probe is racing a flaky forwarder rather than a down
+    # server: WSL's localhost relay accepts the TCP connection and sometimes
+    # fails to relay the Postgres startup packet, so a single-shot probe reports
+    # "no Postgres" against a server that is demonstrably up. Fourteen tests
+    # then skip and the suite reports green -- a skip that reads like a pass is
+    # the worst outcome a conditional test can produce.
+    for _ in range(3):
+        try:
+            with psycopg.connect(DSN, connect_timeout=10) as c:
+                c.execute("select 1")
+            return True
+        except Exception:                                    # noqa: BLE001
+            time.sleep(2)
+    return False
 
 
 pytestmark = pytest.mark.skipif(

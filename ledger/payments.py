@@ -125,13 +125,38 @@ def authorize(ledger: Ledger, payment_id: str, merchant_id: str,
 
 
 def capture(ledger: Ledger, payment_id: str, amount_minor: int,
-            fee_minor: int, request_id: str) -> int:
+            fee_minor: int, request_id: str,
+            idempotency_key: str | None = None) -> int:
     """Release the captured slice of the hold and move the money.
 
     Partial capture is the normal case, not an edge case: the uncaptured
     remainder stays held until void/expiry (remaining 80%).
+
+    A retried capture is MORE dangerous than a retried authorize. An authorize
+    holds funds; a capture MOVES them. Two captures for the same slice pay the
+    merchant twice and take the money from the cardholder twice, and because
+    partial capture is legal the second one often succeeds -- there is usually
+    remaining authorization for it to consume. Nothing about the second call
+    looks wrong.
     """
+    if idempotency_key is not None:
+        payload = {"op": "capture", "payment_id": payment_id,
+                   "amount_minor": amount_minor, "fee_minor": fee_minor}
+        body, _, _ = ledger.run_idempotent(
+            idempotency_key, payload,
+            lambda con: {"txn_id": _capture_locked(
+                ledger, con, payment_id, amount_minor, fee_minor, request_id),
+                "payment_id": payment_id, "op": "capture"})
+        return int(body["txn_id"])
+
     with ledger.tx() as con:
+        return _capture_locked(ledger, con, payment_id, amount_minor,
+                               fee_minor, request_id)
+
+
+def _capture_locked(ledger: Ledger, con, payment_id: str, amount_minor: int,
+                    fee_minor: int, request_id: str) -> int:
+    if True:
         row = con.execute("SELECT * FROM payment WHERE id = ?", (payment_id,)).fetchone()
         if row is None:
             raise PaymentError("unknown payment " + payment_id)
@@ -204,7 +229,7 @@ def void(ledger: Ledger, payment_id: str, request_id: str) -> int:
 
 
 def refund(ledger: Ledger, payment_id: str, amount_minor: int, request_id: str,
-           refund_fee: bool = False) -> int:
+           refund_fee: bool = False, idempotency_key: str | None = None) -> int:
     """Return captured funds to the cardholder.
 
     A refund is NOT a reversal of the capture entry. The original capture stays
@@ -217,8 +242,28 @@ def refund(ledger: Ledger, payment_id: str, amount_minor: int, request_id: str,
     default is False and the fee stays earned. Making it a parameter rather than
     a hard-coded choice is the point -- it is a pricing decision, not a
     technical one.
+
+    A retried refund pays the cardholder twice out of the merchant's balance,
+    which the merchant discovers at settlement rather than at the time.
     """
+    if idempotency_key is not None:
+        payload = {"op": "refund", "payment_id": payment_id,
+                   "amount_minor": amount_minor, "refund_fee": refund_fee}
+        body, _, _ = ledger.run_idempotent(
+            idempotency_key, payload,
+            lambda con: {"txn_id": _refund_locked(
+                ledger, con, payment_id, amount_minor, request_id, refund_fee),
+                "payment_id": payment_id, "op": "refund"})
+        return int(body["txn_id"])
+
     with ledger.tx() as con:
+        return _refund_locked(ledger, con, payment_id, amount_minor,
+                              request_id, refund_fee)
+
+
+def _refund_locked(ledger: Ledger, con, payment_id: str, amount_minor: int,
+                   request_id: str, refund_fee: bool = False) -> int:
+    if True:
         row = con.execute("SELECT * FROM payment WHERE id = ?", (payment_id,)).fetchone()
         if row is None:
             raise PaymentError("unknown payment " + payment_id)

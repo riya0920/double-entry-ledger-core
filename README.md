@@ -1,16 +1,16 @@
 # SE-1 — Fintech Core: Double-Entry Ledger + Payment API
 
-**Status: ~97%.** Ledger invariants enforced by database trigger, **idempotency
+**Status: ~99%.** Ledger invariants enforced by database trigger, **idempotency
 on the payment endpoints as well as on raw postings**, the full payment lifecycle
 including expiry, deterministic FX with period-end revaluation, balance
 snapshots, and a **measured API latency curve that shows the single-writer
-contention rather than hiding it** — **87 tests**, including a `hypothesis`
+contention rather than hiding it** — **109 tests**, including a `hypothesis`
 stateful model and the complete illegal-transition cross-product -- **and a
 PostgreSQL 18 port running under real SERIALIZABLE**, which measured something
 that argues against this project's central design decision.
 
 ```bash
-python -m pytest tests -q              # 87 tests
+python -m pytest tests -q              # 109 tests
 python drift_test.py --txns 8000       # four-invariant concurrency drill
 python run_api_load.py                 # latency curve + contention + invariants
 python pg_drift_test.py --txns 800 --workers 16   # real SERIALIZABLE + retries
@@ -271,6 +271,57 @@ the entries since. This repo already has `balance_snapshot` and
 `balance_as_of_snapshotted` for exactly that shape on the SQLite side. Porting it
 is the real work, and this experiment is what says it is worth doing.
 
+## Period close, consolidation, and authorization adjustments
+
+Three gaps closed together, because each one is a thing a real ledger is asked
+for on day two.
+
+**`ledger/periods.py` — a close that changes what the ledger accepts.** Every
+posting was stamped `datetime('now')`, so "is January final?" had no answer:
+nothing stopped a January-dated posting landing tomorrow. A close is not a flag
+on a report, it is a rule — after it, a posting whose *effective* date falls in
+that period is refused.
+
+That needs effective date to be a **separate column** from `created_at`. A
+backdated correction is January money recorded in February, and conflating the
+two means you can never backdate at all — which sounds safe and is exactly why
+people post to the wrong period instead.
+
+The two policies for a late item are implemented separately and neither is the
+default: **restate** reopens January and changes a published number;
+**adjust forward** leaves January alone and books it in February. Reopening
+requires a named approver *and* a recorded reason — "reopened" with no reason is
+the audit-trail equivalent of no audit trail.
+
+**`ledger/reporting.py` — one number, and the residual it creates.** With EUR
+and USD balances side by side there is no "total assets" until somebody names a
+rate. Consolidation needs **two**: closing for balance-sheet items, average for
+income-statement items. Translating revenue at the closing rate makes a month's
+earnings move because the currency moved on the last day.
+
+The residual between the two rates is the **cumulative translation adjustment**,
+and it belongs in equity rather than P&L — it is not a gain anybody realised.
+**A consolidation reporting no CTA has almost certainly used one rate for
+everything**, so it is a named line and a test asserts a single-currency book
+produces exactly zero.
+
+**`ledger/adjustments.py` — authorizations that change size.** Hotels increment
+for room service, fuel pumps adjust to the real amount, restaurants increment
+for the tip. Without this transition the workarounds are both wrong: void and
+re-authorize loses the original authorization date that the scheme's expiry
+clock runs from, and capturing the difference moves money before the stay ends.
+
+An adjustment is an authorize of a different size — the same two accounts,
+signed — so it never pays the merchant. The rule that matters: **a decrement can
+never go below what is already captured.** Partial capture makes that reachable
+(capture 80, decrement to 50, and the book says you hold less than you have paid
+out), and a test drives exactly that sequence.
+
+**Capture and refund now take an `Idempotency-Key` too.** A retried capture is
+worse than a retried authorize: an authorize holds funds, a capture *moves*
+them, and because partial capture is legal the second call usually finds
+remaining authorization to consume. Nothing about it looks wrong.
+
 ## What is NOT built
 
 1. **Snapshot-backed balances on Postgres.** The experiment above shows the
@@ -284,14 +335,17 @@ is the real work, and this experiment is what says it is worth doing.
 3. **A connection pool.** `PgLedger` holds one connection per instance, which
    stands in for a pool at one connection per worker thread. A real service
    needs pgbouncer or an application pool with a sizing argument behind it.
-4. **Idempotency on capture and refund.** `authorize` takes an
-   `Idempotency-Key`; capture and refund still do not, so a retried capture can
-   double-capture. The mechanism (`run_idempotent`) is in place and the wiring
-   is not.
-5. **Multi-currency reporting.** FX position accounts and period-end revaluation
-   exist; there is no consolidated reporting currency.
-6. **Authorization incremental/decremental adjustments** — real card auths get
-   topped up (hotels, fuel) and this lifecycle has no transition for it.
-7. **Backdating and period close.** Every posting is `now()`. There is no
-   accounting period, no close, and nothing preventing a posting into a closed
-   month.
+4. **Idempotency on the HTTP capture and refund endpoints.** The library
+   functions take an `Idempotency-Key` now; `serve.py` exposes it only on
+   `/payments/authorize`, so the guarantee is available to a library caller and
+   not yet to an HTTP one.
+5. **Rates from a source.** `RateSet` takes closing and average rates as
+   declared inputs. Nothing fetches them, and nothing checks them against a
+   published fixing -- a consolidation is only as good as the rate table
+   somebody typed in.
+6. **Scheme-specific adjustment rules.** The mechanism is there; the card
+   networks each cap how many increments an authorization may take and how far
+   it may grow, and none of that is modelled.
+7. **Period close wired into `post()`.** `periods.guard` refuses a posting into
+   a closed month and callers must invoke it; `Ledger.post` does not call it
+   automatically, so the control is available rather than enforced.
