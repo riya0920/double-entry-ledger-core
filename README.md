@@ -366,11 +366,39 @@ remaining authorization to consume. Nothing about it looks wrong.
    functions take an `Idempotency-Key` now; `serve.py` exposes it only on
    `/payments/authorize`, so the guarantee is available to a library caller and
    not yet to an HTTP one.
-5. **Rates from a source.** `RateSet` takes closing and average rates as
+5. ~~**Rates from a source.**~~ **DONE** — `ledger/rates.py` is a rate STORE
+   with the properties a consolidation actually needs: dated (a rate is a fact
+   about an instant), **immutable once published** (a restatement is a new
+   effective date, not an edit, or last quarter's report stops reproducing),
+   sourced (`ecb | provider | manual` — a manual override is legitimate and is
+   the one an auditor asks about), Decimal-only enforced at the boundary, and it
+   **raises on a missing rate** rather than defaulting to 1.0 or carrying the
+   last one forward, either of which produces a consolidation that balances and
+   is wrong.
+
+   `fetch_ecb` pulls real ECB reference rates and is explicit — never called at
+   import or by a reporting run, because a consolidation whose numbers depend on
+   whether a web request succeeded is not reproducible. It inverts EUR-per-unit
+   to unit-per-EUR in one place, and labels the average as a stand-in because
+   the daily file has no period mean. Superseded note: `RateSet` takes closing
+   and average rates as
    declared inputs. Nothing fetches them, and nothing checks them against a
    published fixing -- a consolidation is only as good as the rate table
    somebody typed in.
-6. **Scheme-specific adjustment rules.** The mechanism is there; the card
+6. ~~**Scheme-specific adjustment rules.**~~ **DONE** — `ledger/schemes.py`,
+   deliberately OUTSIDE the ledger. `adjust` enforces what is true of
+   double-entry (a decrement may never fall below what is captured); this
+   enforces what is true of Visa in 2026. A limit inside the ledger is a limit
+   the ledger cannot be operated without, and scheme rules change quarterly.
+
+   Constraints by count, by cumulative ratio **against the ORIGINAL** (three 15%
+   increments on a running total is 52%, not 45%), by MCC eligibility, and by an
+   expiry clock that runs from the original authorization — the rule most likely
+   to be got wrong, and re-introducing it would undo what `adjustments.py`
+   avoided by not re-authorizing. A scheme with no incremental support says so
+   rather than being treated as a small limit. Limits are `ASSUMED_`, not
+   quoted: real ones are licensed and versioned. Superseded note: The mechanism
+   is there; the card
    networks each cap how many increments an authorization may take and how far
    it may grow, and none of that is modelled.
 7. **Period close wired into `post()`.** `periods.guard` refuses a posting into
