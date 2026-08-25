@@ -191,36 +191,97 @@ def api_authorize(body: AuthorizeIn,
     return {"payment_id": body.payment_id, "txn_id": txn, "state": "authorized"}
 
 
+def _replayed(lg, key: str) -> bool:
+    """Was this key already on record BEFORE the call that just ran?
+
+    Asked before the operation, because afterwards every key is present and the
+    answer would always be "replay".
+    """
+    return lg._lookup_key(key) is not None
+
+
+# THE HEADER WAS REQUIRED ON /postings AND NOT ON THESE, WHICH IS BACKWARDS.
+#
+# `ledger/payments.py` gained an optional `idempotency_key` on capture and
+# refund, with a docstring saying "a retried capture is MORE dangerous than a
+# retried authorize -- an authorize holds funds; a capture MOVES them". The HTTP
+# layer never passed it. Every capture used the hardcoded request id
+# "req-cap-<payment_id>", so two different captures on the same payment shared a
+# request id and no retry was ever detected.
+#
+# So the most dangerous endpoints in the service were the only mutating ones
+# without the protection the least dangerous one enforced.
 @app.post("/payments/{payment_id}/capture")
-def api_capture(payment_id: str, body: CaptureIn) -> dict:
+def api_capture(response: Response, payment_id: str, body: CaptureIn,
+                idempotency_key: str | None = Header(None)) -> dict:
     lg = _ledger()
+    if not idempotency_key:
+        raise HTTPException(
+            400, "Idempotency-Key header is required on capture: an authorize "
+                 "holds funds and a capture MOVES them, so a retried capture "
+                 "is the more dangerous of the two")
+    # `capture` already builds the payload and calls `run_idempotent` itself
+    # when given a key -- so the endpoint passes the header through rather than
+    # wrapping it again. Wrapping produced "cannot start a transaction within a
+    # transaction", which is what a second implementation of an existing
+    # mechanism looks like from the outside.
+    replayed = _replayed(lg, idempotency_key)
     try:
         txn = capture(lg, payment_id, body.amount_minor, body.fee_minor,
-                      "req-cap-" + payment_id)
+                      "req-cap-" + idempotency_key,
+                      idempotency_key=idempotency_key)
+    except IdempotencyConflict as exc:
+        raise HTTPException(409, str(exc))
     except PaymentError as exc:
         raise HTTPException(422, str(exc))
-    return {"payment_id": payment_id, "txn_id": txn, **_payment_state(lg, payment_id)}
+    response.headers["Idempotent-Replay"] = "true" if replayed else "false"
+    return {"payment_id": payment_id, "txn_id": txn, "replayed": replayed,
+            **_payment_state(lg, payment_id)}
 
 
 @app.post("/payments/{payment_id}/refund")
-def api_refund(payment_id: str, body: RefundIn) -> dict:
+def api_refund(response: Response, payment_id: str, body: RefundIn,
+               idempotency_key: str | None = Header(None)) -> dict:
     lg = _ledger()
+    if not idempotency_key:
+        raise HTTPException(
+            400, "Idempotency-Key header is required on refund: a duplicated "
+                 "refund pays the customer twice out of the merchant's money")
+    replayed = _replayed(lg, idempotency_key)
     try:
-        txn = refund(lg, payment_id, body.amount_minor, "req-ref-" + payment_id,
-                     refund_fee=body.refund_fee)
+        txn = refund(lg, payment_id, body.amount_minor,
+                     "req-ref-" + idempotency_key,
+                     refund_fee=body.refund_fee,
+                     idempotency_key=idempotency_key)
+    except IdempotencyConflict as exc:
+        raise HTTPException(409, str(exc))
     except PaymentError as exc:
         raise HTTPException(422, str(exc))
-    return {"payment_id": payment_id, "txn_id": txn, **_payment_state(lg, payment_id)}
+    response.headers["Idempotent-Replay"] = "true" if replayed else "false"
+    return {"payment_id": payment_id, "txn_id": txn, "replayed": replayed,
+            **_payment_state(lg, payment_id)}
 
 
 @app.post("/payments/{payment_id}/void")
-def api_void(payment_id: str) -> dict:
+def api_void(response: Response, payment_id: str,
+             idempotency_key: str | None = Header(None)) -> dict:
     lg = _ledger()
+    if not idempotency_key:
+        raise HTTPException(
+            400, "Idempotency-Key header is required on void")
+    # `void` gained an idempotency_key for this -- it was the only one of the
+    # three payment operations without one.
+    replayed = _replayed(lg, idempotency_key)
     try:
-        txn = void(lg, payment_id, "req-void-" + payment_id)
+        txn = void(lg, payment_id, "req-void-" + idempotency_key,
+                   idempotency_key=idempotency_key)
+    except IdempotencyConflict as exc:
+        raise HTTPException(409, str(exc))
     except PaymentError as exc:
         raise HTTPException(422, str(exc))
-    return {"payment_id": payment_id, "txn_id": txn, **_payment_state(lg, payment_id)}
+    response.headers["Idempotent-Replay"] = "true" if replayed else "false"
+    return {"payment_id": payment_id, "txn_id": txn, "replayed": replayed,
+            **_payment_state(lg, payment_id)}
 
 
 @app.get("/payments/{payment_id}")

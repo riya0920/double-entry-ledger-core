@@ -332,10 +332,37 @@ remaining authorization to consume. Nothing about it looks wrong.
 2. **The spec's 100K / 50-worker figure.** The Postgres drill runs at 800/16 in
    a reasonable time; at 100K it would take hours on a hot account precisely
    because of item 1, so the number is still not claimed.
-3. **A connection pool.** `PgLedger` holds one connection per instance, which
+3. ~~**A connection pool.**~~ **partly done, and it exposed a real bug.**
+   `Ledger` held a thread-local connection to `":memory:"` — which names a
+   database **private to the connection**, so every thread got its own EMPTY
+   database. Thread A ran the schema; thread B opened a blank one with the same
+   name. In-process tests never saw it because they build and use the Ledger on
+   one thread; it surfaced the moment an HTTP request touched the idempotency
+   table and got `no such table: idempotency_key` on a schema that plainly
+   creates it. Fixed with a shared-cache URI plus a keepalive connection (a
+   shared in-memory database dies with its last connection).
+
+   Still per-thread rather than pooled, deliberately: a sqlite3 connection may
+   not be shared across threads, and the interesting contention is the write
+   lock — a pool would queue on the same lock one step earlier and measure the
+   queue instead of the database. Superseded note: `PgLedger` holds one
+   connection per instance, which
    stands in for a pool at one connection per worker thread. A real service
    needs pgbouncer or an application pool with a sizing argument behind it.
-4. **Idempotency on the HTTP capture and refund endpoints.** The library
+4. ~~**Idempotency on the HTTP capture and refund endpoints.**~~ **DONE** —
+   and the situation was backwards: `Idempotency-Key` was REQUIRED on
+   `/postings` and absent from capture, refund and void, so the most dangerous
+   endpoints were the only unprotected ones. Every capture used the hardcoded
+   request id `"req-cap-<payment_id>"`, so two different captures shared one and
+   no retry was ever detected.
+
+   All three now require the header, bind the payload to the key (409 on reuse
+   with a different amount), and return `Idempotent-Replay`. `void` gained an
+   `idempotency_key` — it was the only one of the three without one, and "the
+   state machine happens to reject the second call" is a different guarantee
+   from "this is idempotent": the caller got a 422 for a retry that in fact
+   succeeded. Verified over HTTP: a retried capture replays the same txn id and
+   `captured_minor` stays at 4,000. Superseded note: The library
    functions take an `Idempotency-Key` now; `serve.py` exposes it only on
    `/payments/authorize`, so the guarantee is available to a library caller and
    not yet to an HTTP one.

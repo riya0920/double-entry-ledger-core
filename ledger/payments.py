@@ -205,14 +205,36 @@ def _guard(state: str, action: str) -> None:
                         sorted(a for (s, a) in ALLOWED if s == state) or "none (terminal)"))
 
 
-def void(ledger: Ledger, payment_id: str, request_id: str) -> int:
+def void(ledger: Ledger, payment_id: str, request_id: str,
+         idempotency_key: str | None = None) -> int:
     """Release an authorization without moving money.
 
     Void is only legal before any capture. Once funds have moved the correct
     instrument is a refund, and conflating the two is how a reversal gets booked
     against a hold that no longer exists.
+
+    Takes an `idempotency_key` for the same reason capture and refund do, and it
+    was the only one of the three without it. A retried void is the mildest of
+    the three -- the second is refused by `_guard` because the payment is
+    already `voided` -- but "the state machine happens to reject it" is a
+    different guarantee from "this is idempotent", and the caller gets a 422
+    for a retry that in fact succeeded.
     """
+    if idempotency_key is not None:
+        payload = {"op": "void", "payment_id": payment_id}
+        body, _, _ = ledger.run_idempotent(
+            idempotency_key, payload,
+            lambda con: {"txn_id": _void_locked(ledger, con, payment_id,
+                                                request_id),
+                         "payment_id": payment_id, "op": "void"})
+        return int(body["txn_id"])
+
     with ledger.tx() as con:
+        return _void_locked(ledger, con, payment_id, request_id)
+
+
+def _void_locked(ledger: Ledger, con, payment_id: str, request_id: str) -> int:
+    if True:
         row = con.execute("SELECT * FROM payment WHERE id = ?", (payment_id,)).fetchone()
         if row is None:
             raise PaymentError("unknown payment " + payment_id)
@@ -225,7 +247,7 @@ def void(ledger: Ledger, payment_id: str, request_id: str) -> int:
             actor="payments-api", reason="void:" + payment_id,
             request_id=request_id, con=con)
         con.execute("UPDATE payment SET state = 'voided' WHERE id = ?", (payment_id,))
-    return txn
+        return txn
 
 
 def refund(ledger: Ledger, payment_id: str, amount_minor: int, request_id: str,

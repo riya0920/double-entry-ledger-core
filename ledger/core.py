@@ -71,20 +71,66 @@ class Ledger:
     def __init__(self, path: str | Path = ":memory:"):
         self.path = str(path)
         self._local = threading.local()
+
+        # A THREAD-LOCAL CONNECTION TO ":memory:" GIVES EVERY THREAD ITS OWN
+        # EMPTY DATABASE, and that is not a tuning detail -- it is a silent,
+        # total failure under any threaded server.
+        #
+        # SQLite's ":memory:" names a database PRIVATE TO THE CONNECTION. With
+        # a thread-local connection, thread A runs the schema and thread B
+        # opens a fresh blank database that happens to have the same name. The
+        # constructor's own schema write lands in whichever thread constructed
+        # the Ledger and is invisible to every request thread after it.
+        #
+        # Found by wiring Idempotency-Key into the payment endpoints: the first
+        # request against a TestClient failed with `no such table:
+        # idempotency_key`, on a schema that plainly creates it. In-process
+        # tests never saw it because they construct and use the Ledger on one
+        # thread.
+        #
+        # A shared cache URI makes ":memory:" mean "the same database for every
+        # connection in this process", which is what a caller passing
+        # ":memory:" always meant. `uri=True` is required for the connect
+        # string to be parsed as one.
+        self._memory_uri = None
+        if self.path == ":memory:":
+            self._memory_uri = "file:ledger-{}?mode=memory&cache=shared".format(
+                id(self))
+            # One connection held open for the lifetime of the Ledger. A shared
+            # in-memory database is destroyed when the LAST connection to it
+            # closes, so without this the schema evaporates the moment a
+            # request thread finishes and closes its own.
+            self._keepalive = self._new_connection()
+
         con = self._conn()
         con.executescript(SCHEMA.read_text())
 
     # -- connection handling -------------------------------------------------
+    def _new_connection(self) -> sqlite3.Connection:
+        target = self._memory_uri or self.path
+        con = sqlite3.connect(target, timeout=30, isolation_level=None,
+                              uri=bool(self._memory_uri))
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA foreign_keys = ON")
+        con.execute("PRAGMA busy_timeout = 30000")
+        if self.path != ":memory:":
+            con.execute("PRAGMA journal_mode = WAL")
+            con.execute("PRAGMA synchronous = NORMAL")
+        return con
+
     def _conn(self) -> sqlite3.Connection:
+        """One connection per thread, all pointing at the SAME database.
+
+        Per-thread rather than pooled because a sqlite3 connection may not be
+        shared across threads, and because the interesting contention here is
+        the write lock rather than connection setup -- a pool would queue on
+        the same lock one step earlier and measure the queue instead of the
+        database. `PgLedger` is where a real pool belongs, and SE-1's README
+        still says so.
+        """
         con = getattr(self._local, "con", None)
         if con is None:
-            con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-            con.row_factory = sqlite3.Row
-            con.execute("PRAGMA foreign_keys = ON")
-            con.execute("PRAGMA busy_timeout = 30000")
-            if self.path != ":memory:":
-                con.execute("PRAGMA journal_mode = WAL")
-                con.execute("PRAGMA synchronous = NORMAL")
+            con = self._new_connection()
             self._local.con = con
         return con
 
