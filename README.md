@@ -324,11 +324,61 @@ remaining authorization to consume. Nothing about it looks wrong.
 
 ## What is NOT built
 
-1. **Snapshot-backed balances on Postgres.** The experiment above shows the
-   derived design fixes most of the contention and moves the cost to the read
-   path, where it grows with history. Neither extreme is the answer; periodic
-   snapshots are, and the SQLite side already has that machinery. Porting it is
-   the remaining work, and it is now a specified job rather than a hunch.
+1. ~~**Snapshot-backed balances on Postgres.**~~ **DONE** —
+   `ledger/pg_snapshot.py`, `docs/PG_SNAPSHOTS.md`,
+   `docs/PG_SNAPSHOT_READS.md`, `docs/PG_SNAPSHOT_STATS.md`, and seven tests in
+   `tests/test_pg_snapshot.py`. Read cost against history depth, in buffers
+   touched (a number the host's load cannot move) on PostgreSQL 18.6:
+
+   | entries | full scan | snapshotted |
+   |---|---|---|
+   | 40,000 | 847 buf | 12 buf |
+   | 200,000 | 7,480 buf | 16 buf |
+
+   The scan grows 8.8× over that range and the snapshotted read does not grow
+   at all — **467× fewer buffers at 200,000 entries.** The write path is
+   untouched: `post()` passes straight through, because a checkpoint that
+   changed the write path would hand back the contention the derived design
+   was built to remove.
+
+   **It is not a port, and calling it one is what makes it dangerous.** SQLite
+   serializes writers with a database-level lock, so *everything up to here* is
+   a moment that exists. Postgres runs writers concurrently, so it is not.
+   `d_journal_entry.id` comes from an IDENTITY sequence and **a sequence value
+   is allocated before commit**, so a transaction holding a low id can still be
+   in flight while one holding a higher id has committed. A snapshot that
+   trusts `MAX(id)` writes a watermark *above* an entry it could not see, and
+   the delta query then skips that same entry for being *below* the watermark.
+   It lands in neither half. Forced with two connections rather than raced:
+   the checkpoint reports a balance **7,777 minor units short**, exactly the
+   lost entry, and nothing errors. Fixed by draining — wait until
+   `pg_snapshot_xmin(pg_current_snapshot())` passes the `xmax` captured at
+   watermark time, so every transaction that could still write below it has
+   ended — after which the same test reports a delta of 0.
+
+   Two more things running it found, both of which argue against my own first
+   answer:
+
+   - **A correct checkpoint that did no less work.** The delta query read every
+     entry for the account and discarded all 200,000 of them, touching the same
+     2,029 buffers as the full scan it replaced. The answer was right, so no
+     correctness test could see it. I diagnosed a missing index and added
+     `(account_id, id)`. **That was wrong** — isolating the causes shows a
+     freshly bulk-loaded table simply has no statistics: 8,283 buffers before
+     `ANALYZE`, 46 after, and with the composite index present the planner
+     *still* picks `d_journal_entry_pkey` and never uses it. The index was
+     removed again; an unused index is a write cost paid for a read benefit
+     that does not exist. `docs/PG_SNAPSHOT_STATS.md` has the three-way table.
+   - **A stale checkpoint that was silently trusted.** `DERIVED_SCHEMA`
+     recreates the journal but not `d_balance_snapshot`, so checkpoints from a
+     previous run survived with watermarks above every live entry — the delta
+     matched nothing and `balance()` returned the old total, **wrong by 5×**.
+     Caught only because the benchmark asserts the checkpoint against a full
+     scan on every step. `balance()` now raises `StaleSnapshot` rather than
+     trusting a watermark past the end of the journal.
+
+   Still not claimed: the drain's cost under a long-running writer, and the
+   cost of a snapshot sweep across many accounts. Both are named in the docs.
 2. **The spec's 100K / 50-worker figure.** The Postgres drill runs at 800/16 in
    a reasonable time; at 100K it would take hours on a hot account precisely
    because of item 1, so the number is still not claimed.
