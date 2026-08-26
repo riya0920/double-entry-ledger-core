@@ -198,3 +198,35 @@ CREATE TABLE IF NOT EXISTS balance_snapshot (
     PRIMARY KEY (account_id, as_of)
 );
 CREATE INDEX IF NOT EXISTS ix_snapshot_account ON balance_snapshot(account_id, as_of);
+
+
+-- ---------------------------------------------------------------- periods
+--
+-- MOVED HERE FROM periods.install(). `Ledger.post` now enforces the period
+-- guard rather than offering it, so these tables are part of the ledger's own
+-- schema -- a guard that queries a table which may not exist is a guard that
+-- fails open on a fresh database, which is the state every test starts in.
+--
+-- The alternative was to have `guard` tolerate a missing table. That would
+-- have recreated exactly the problem being fixed: the control silently absent
+-- rather than enforced.
+
+CREATE TABLE IF NOT EXISTS accounting_period (
+    period       TEXT PRIMARY KEY,          -- 'YYYY-MM'
+    status       TEXT NOT NULL CHECK (status IN ('open','closed')),
+    closed_at    TEXT,
+    closed_by    TEXT,
+    reopened_at  TEXT,
+    reopened_by  TEXT,
+    reopen_reason TEXT
+);
+
+-- Effective date is SEPARATE from created_at. created_at is when we wrote the
+-- row; effective_on is when the money moved. A backdated correction has
+-- created_at > effective_on, and that difference is the whole subject of this
+-- module.
+CREATE TABLE IF NOT EXISTS txn_effective_date (
+    txn_id       INTEGER PRIMARY KEY REFERENCES journal_txn(id),
+    effective_on TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_effective ON txn_effective_date(effective_on);

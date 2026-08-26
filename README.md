@@ -401,6 +401,15 @@ remaining authorization to consume. Nothing about it looks wrong.
    is there; the card
    networks each cap how many increments an authorization may take and how far
    it may grow, and none of that is modelled.
-7. **Period close wired into `post()`.** `periods.guard` refuses a posting into
-   a closed month and callers must invoke it; `Ledger.post` does not call it
-   automatically, so the control is available rather than enforced.
+7. ~~**Period close wired into `post()`.**~~ **DONE** — `Ledger.post` now calls
+   `periods.guard` itself. "Available rather than enforced" is the same shape as
+   every other bug this repo has found: a rule nothing calls is a rule that is
+   not in effect.
+
+   Two decisions came with it. An unstated `effective_on` defaults to **today**,
+   not to exempt — a posting with no stated date IS being made today, and
+   treating the omission as exempt would make the guard optional by silence. And
+   the period tables moved into `ledger/schema.sql`: a guard that queries a
+   table which may not exist fails **open** on a fresh database, which is the
+   state every test starts in, so having `guard` tolerate a missing table would
+   have recreated exactly the problem being fixed.

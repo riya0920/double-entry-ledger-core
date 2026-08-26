@@ -162,12 +162,28 @@ class Ledger:
 
     # -- the only way money moves -------------------------------------------
     def post(self, entries: Sequence[Entry], actor: str, reason: str,
-             request_id: str, con: sqlite3.Connection | None = None) -> int:
+             request_id: str, con: sqlite3.Connection | None = None,
+             effective_on: str | None = None) -> int:
         """Append one balanced transaction; returns txn_id.
 
         The balance rule is enforced by the database (trigger
         txn_seal_must_balance), not here. The Python check below only buys a
         typed error with a readable message before paying for round trips.
+
+        THE PERIOD GUARD IS ENFORCED HERE, NOT OFFERED. `periods.guard` refuses
+        a posting into a closed month, and callers used to have to remember to
+        invoke it -- so the control was AVAILABLE rather than enforced, which is
+        the same shape as every other bug this repo has found: a rule nothing
+        calls is a rule that is not in effect.
+
+        `effective_on` defaults to today when a caller does not say. That is the
+        honest default: a posting with no stated effective date IS being made
+        today, and treating an unstated date as "exempt from the close" would
+        make the guard optional again by omission rather than by argument.
+
+        The guard runs INSIDE the transaction, before the insert. Checking after
+        the write and rolling back would leave the sequence allocated and the
+        error arriving after the effect.
         """
         if not entries:
             raise Unbalanced("a transaction needs at least two entries")
@@ -181,6 +197,13 @@ class Ledger:
 
         ctx = self.tx() if con is None else _null_ctx(con)
         with ctx as c:
+            # Imported here rather than at module scope: `periods` imports from
+            # this module, and a top-level import would be circular.
+            from . import periods
+
+            eff = effective_on or utcnow()[:10]
+            periods.guard(c, eff)
+
             cur = c.execute(
                 "INSERT INTO journal_txn (created_at, actor, reason, request_id, sealed)"
                 " VALUES (?,?,?,?,0)", (utcnow(), actor, reason, request_id))

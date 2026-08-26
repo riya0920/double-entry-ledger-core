@@ -247,3 +247,77 @@ def test_the_limits_are_named_as_assumptions():
     assert hasattr(sch, "ASSUMED_RULES")
     assert not hasattr(sch, "SCHEME_RULES")
     assert "STAND-INS" in sch.__doc__ or "stand-ins" in sch.__doc__
+
+
+# --------------------------------- the period guard, enforced not offered
+def test_a_posting_into_a_closed_period_is_refused_by_post_itself():
+    """The README said the control was "available rather than enforced":
+    `periods.guard` existed and callers had to remember to call it. A rule
+    nothing calls is a rule that is not in effect -- the same shape as every
+    other bug this repo has found."""
+    from ledger import periods
+    from ledger.core import Ledger, credit, debit
+    from ledger.payments import HOLD_ASSET, HOLD_LIAB, bootstrap_accounts
+
+    lg = Ledger(":memory:")
+    bootstrap_accounts(lg, "m1")
+    periods.close_period(lg._conn(), "2026-03", closed_by="controller")
+
+    with pytest.raises(periods.PeriodClosed):
+        lg.post([debit(HOLD_ASSET, 100, "USD"),
+                 credit(HOLD_LIAB, 100, "USD")],
+                actor="t", reason="late", request_id="r-closed",
+                effective_on="2026-03-15")
+
+
+def test_an_open_period_still_posts():
+    from ledger import periods
+    from ledger.core import Ledger, credit, debit
+    from ledger.payments import HOLD_ASSET, HOLD_LIAB, bootstrap_accounts
+
+    lg = Ledger(":memory:")
+    bootstrap_accounts(lg, "m1")
+    periods.close_period(lg._conn(), "2026-03", closed_by="controller")
+
+    txn = lg.post([debit(HOLD_ASSET, 100, "USD"),
+                   credit(HOLD_LIAB, 100, "USD")],
+                  actor="t", reason="fine", request_id="r-open",
+                  effective_on="2026-04-02")
+    assert txn > 0
+
+
+def test_an_unstated_effective_date_defaults_to_today_not_to_exempt():
+    """The honest default. A posting with no stated effective date IS being
+    made today, and treating an unstated date as exempt from the close would
+    make the guard optional by omission rather than by argument."""
+    import inspect
+
+    from ledger.core import Ledger
+
+    src = inspect.getsource(Ledger.post)
+    assert "effective_on or utcnow()[:10]" in src
+    assert "periods.guard(c, eff)" in src
+
+
+def test_the_guard_runs_before_the_insert_not_after():
+    """Checking after the write and rolling back would leave the sequence
+    allocated and the error arriving after the effect."""
+    import inspect
+
+    from ledger.core import Ledger
+
+    src = inspect.getsource(Ledger.post)
+    assert src.index("periods.guard(c, eff)") < src.index("INSERT INTO journal_txn")
+
+
+def test_the_period_tables_are_part_of_the_ledger_schema():
+    """A guard that queries a table which may not exist is a guard that fails
+    OPEN on a fresh database -- the state every test starts in. Having `guard`
+    tolerate a missing table would have recreated the problem being fixed."""
+    from ledger.core import Ledger
+
+    lg = Ledger(":memory:")
+    tables = {r[0] for r in lg._conn().execute(
+        "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    assert "accounting_period" in tables
+    assert "txn_effective_date" in tables
