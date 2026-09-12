@@ -1,3 +1,6 @@
 pytest>=8
 hypothesis>=6
 psycopg[binary]>=3.2        # Postgres port: pg_drift_test.py, tests/test_pg_serializable.py
+fastapi>=0.110              # serve.py HTTP layer; test_api.py + test_payment_idempotency.py
+uvicorn>=0.29              # ASGI server for serve.py
+pydantic>=2.6              # request/response models in serve.py

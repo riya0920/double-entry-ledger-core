@@ -4,13 +4,13 @@
 on the payment endpoints as well as on raw postings**, the full payment lifecycle
 including expiry, deterministic FX with period-end revaluation, balance
 snapshots, and a **measured API latency curve that shows the single-writer
-contention rather than hiding it** — **109 tests**, including a `hypothesis`
+contention rather than hiding it** — **158 tests** (137 pass; 21 PostgreSQL tests skip without a live server), including a `hypothesis`
 stateful model and the complete illegal-transition cross-product -- **and a
 PostgreSQL 18 port running under real SERIALIZABLE**, which measured something
 that argues against this project's central design decision.
 
 ```bash
-python -m pytest tests -q              # 109 tests
+python -m pytest tests -q              # 158 tests (21 Postgres tests skip without a server)
 python drift_test.py --txns 8000       # four-invariant concurrency drill
 python run_api_load.py                 # latency curve + contention + invariants
 python pg_drift_test.py --txns 800 --workers 16   # real SERIALIZABLE + retries
