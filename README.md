@@ -1,10 +1,10 @@
-# SE-1 — Fintech Core: Double-Entry Ledger + Payment API
+# SE-1: Fintech Core: Double-Entry Ledger + Payment API
 
 **Status: ~99%.** Ledger invariants enforced by database trigger, **idempotency
 on the payment endpoints as well as on raw postings**, the full payment lifecycle
 including expiry, deterministic FX with period-end revaluation, balance
 snapshots, and a **measured API latency curve that shows the single-writer
-contention rather than hiding it** — **158 tests** (137 pass; 21 PostgreSQL tests skip without a live server), including a `hypothesis`
+contention rather than hiding it**: **158 tests** (137 pass; 21 PostgreSQL tests skip without a live server), including a `hypothesis`
 stateful model and the complete illegal-transition cross-product -- **and a
 PostgreSQL 18 port running under real SERIALIZABLE**, which measured something
 that argues against this project's central design decision.
@@ -23,7 +23,7 @@ uvicorn serve:app --port 8100          # HTTP API
 There is no `accounts.balance` column that anyone writes to. The journal is the
 source of truth; `account_balance` is a materialized cache maintained by trigger,
 and `invariants.py:i3` re-derives every balance from the journal to prove the
-cache has not drifted. Corrections are reversing entries — `journal_entry` raises
+cache has not drifted. Corrections are reversing entries: `journal_entry` raises
 on `UPDATE` and on `DELETE`.
 
 Money is `INTEGER` minor units everywhere. `grep -i "REAL\|FLOAT" ledger/schema.sql`
@@ -49,16 +49,16 @@ returns nothing, and `Entry.__post_init__` refuses a float at the type boundary
 
 The journal write **and the serialized response body** commit in the same
 database transaction. That is why a crash after commit but before the client ever
-sees a response still replays byte-identical on retry — there is no window where
+sees a response still replays byte-identical on retry: there is no window where
 the effect exists and the recorded answer does not. Concurrent duplicates are
 arbitrated by the primary key on `idempotency_key`, not by a read-then-write
 check (which is TOCTOU and would admit two effects).
 
 Same key + **different** payload returns a conflict and deliberately does *not*
-return the first caller's result — returning it would tell caller two that its
+return the first caller's result: returning it would tell caller two that its
 different request succeeded.
 
-## Measured results (methodology attached — this is a floor, not a benchmark)
+## Measured results (methodology attached: this is a floor, not a benchmark)
 
 Run: `python drift_test.py --txns 8000 --workers 8`
 Hardware: Windows 11, single laptop, CPython 3.14, SQLite 3.50.4 in WAL mode.
@@ -77,7 +77,7 @@ ALL INVARIANTS HOLD (I1 balance, I2 floors, I3 derived, I4 idempotency)
 is a correctness-harness throughput, not a claim about the design's parallel
 capacity, and "0 violations" here is weaker evidence than it would be on
 Postgres because true write-write interleaving never occurs. The interesting
-failure mode — serialization anomaly → `40001` → retry loop — cannot happen on
+failure mode, serialization anomaly → `40001` → retry loop, cannot happen on
 this store. Porting to Postgres `SERIALIZABLE` and re-running at 100K/50 workers
 is the first item of remaining work, and the 100K figure in the spec is not
 claimed until that runs.
@@ -89,29 +89,29 @@ claimed until that runs.
 table is a single dictionary and `_guard()` is the only enforcement point, which
 is what makes "illegal transitions are unreachable" checkable rather than
 asserted. `test_illegal_transitions_are_unreachable` runs the **entire 6×3
-cross-product** — 18 pairs, 6 legal — and asserts the ledger invariants survive
+cross-product**, 18 pairs, 6 legal, and asserts the ledger invariants survive
 each attempt.
 
 A refund is not a reversal of the capture entry. The original capture stays in
 the journal because it happened; the refund posts its own balanced entries in the
 opposite direction. Whether the processing fee is returned is a `refund_fee`
-parameter, not a hard-coded choice — it is a pricing decision, not a technical one.
+parameter, not a hard-coded choice: it is a pricing decision, not a technical one.
 
 **FX** (`ledger/fx.py`) turned out to contain the sharpest lesson in this repo: a
 conversion **cannot be two legs**. Debiting a EUR account and crediting a USD one
-leaves both currencies unbalanced and the per-currency seal check rejects it —
+leaves both currencies unbalanced and the per-currency seal check rejects it,
 correctly. Money does not teleport between currencies; it is sold into a position
 and bought out of another, so each side balances within its own currency against
 an FX position account. Rounding is half-even (round-half-up accumulates a
 one-directional bias), rates are `str`/`Decimal` and a float raises, and
-`allocate()` splits an amount so the parts sum **exactly** to the whole — pinned
+`allocate()` splits an amount so the parts sum **exactly** to the whole, pinned
 by a hypothesis property over ±$10M and up to 12 weights.
 
 ## The API load test, and the bug it found
 
 `run_api_load.py` drives `POST /payments/authorize` over real HTTP at rising
 concurrency. Each call opens a transaction, writes two journal entries, updates
-two balance rows through a trigger, seals, and commits an idempotency record —
+two balance rows through a trigger, seals, and commits an idempotency record,
 all in one transaction.
 
 ```
@@ -130,7 +130,7 @@ throughput *falls* to 0.70×. That is what a single-writer store looks like from
 outside: the workers are queueing on a lock, not sharing a machine. Adding
 workers buys nothing and costs the tail. On Postgres SERIALIZABLE the same load
 would interleave, hit serialization anomalies, return `40001` and need a retry
-loop — a genuinely different failure mode this store cannot produce, which is
+loop: a genuinely different failure mode this store cannot produce, which is
 exactly why the 100K/50-worker figure below is still not claimed.
 
 ### The bug: the payments API was not idempotent
@@ -139,7 +139,7 @@ The first run reported **3,200 journal transactions and 0 idempotency keys.**
 
 `/payments/authorize` passed a request id straight to `ledger.post`, which
 records the id on the journal row and creates no idempotency record. So a client
-that timed out and retried placed a **second hold on the card** — the single most
+that timed out and retried placed a **second hold on the card**: the single most
 common payment-API bug, in a repository whose headline property is idempotency.
 The guarantee was real; it was being demonstrated on `/postings`, a path the
 payments API did not take.
@@ -182,7 +182,7 @@ retry on serialization failure".
 ### The diagnosis: a materialized balance is a hot row
 
 Every posting updates **one row** of `account_balance`. Under SERIALIZABLE that
-row is a serialization point — two postings to the same account always conflict.
+row is a serialization point: two postings to the same account always conflict.
 The README above calls the trigger-maintained balance cache *the one design
 decision everything else follows from*. It still is, and this is its cost.
 
@@ -205,17 +205,17 @@ isolation cost**, measured with everything else held constant.
 ### What SERIALIZABLE is buying
 
 `tests/test_pg_serializable.py` **constructs** the anomaly rather than hoping
-load produces one — a concurrency test that waits for a race by luck is a test
+load produces one: a concurrency test that waits for a race by luck is a test
 that passes on a slow day. Two transactions each read a balance of 150, each
 decide a withdrawal of 100 is legal, and both commit:
 
 - under **SERIALIZABLE**: one commits, one gets 40001, balance ends at **50**
-- under **READ COMMITTED**: both commit, balance ends at **−50** — below a floor
+- under **READ COMMITTED**: both commit, balance ends at **−50**: below a floor
   neither transaction ever saw breached
 
 So the choice is not which is better. It is: pay the throughput and the failed
 transactions for a floor that cannot be crossed, or take the throughput and
-enforce floors somewhere a race cannot reach — which in practice means not
+enforce floors somewhere a race cannot reach, which in practice means not
 keeping a hot cached balance at all and aggregating the journal on read. **That
 is now the honest first item of remaining work**, and it is a rewrite this
 project has not done.
@@ -227,7 +227,7 @@ journal entry justified, which is exactly its job.
 ## The hot-row hypothesis, tested
 
 The section above diagnosed the contention as the trigger-maintained
-`account_balance` row and asserted the fix — aggregate the journal on read
+`account_balance` row and asserted the fix: aggregate the journal on read
 instead. **That was reasoning with no experiment behind it**, so
 `pg_hotrow_test.py` runs both designs against the same hot account, same
 isolation, same retry loop.
@@ -244,7 +244,7 @@ isolation, same retry loop.
 cache cut the retry rate roughly in half and took transactions lost outright from
 125 to 3. But 50.6% is not zero: the postings still share a transaction table, a
 sequence and an index, and SERIALIZABLE finds dependencies there too. **The
-balance row was the dominant cause, not the only one** — a weaker claim than the
+balance row was the dominant cause, not the only one**: a weaker claim than the
 one I published, and the one the measurement supports.
 
 The magnitude moves run to run (cached 77–84%, derived 33–51%) because the box is
@@ -261,12 +261,12 @@ Measured on a warm connection, 25 repeats:
 | rows scanned | 1 | 477 |
 
 The first attempt at this measurement opened a fresh connection per read and
-reported the *cached* read as slower — impossible when one scans a single row and
+reported the *cached* read as slower: impossible when one scans a single row and
 the other scans hundreds. It was timing SCRAM handshakes, not queries.
 
 The cost is real and it grows with history: at a million entries the balance
 query scans a million rows, on every authorization. **The production answer is
-neither design alone — it is periodic snapshots**, balance at a checkpoint plus
+neither design alone: it is periodic snapshots**, balance at a checkpoint plus
 the entries since. This repo already has `balance_snapshot` and
 `balance_as_of_snapshotted` for exactly that shape on the SQLite side. Porting it
 is the real work, and this experiment is what says it is worth doing.
@@ -276,43 +276,43 @@ is the real work, and this experiment is what says it is worth doing.
 Three gaps closed together, because each one is a thing a real ledger is asked
 for on day two.
 
-**`ledger/periods.py` — a close that changes what the ledger accepts.** Every
+**`ledger/periods.py`: a close that changes what the ledger accepts.** Every
 posting was stamped `datetime('now')`, so "is January final?" had no answer:
 nothing stopped a January-dated posting landing tomorrow. A close is not a flag
-on a report, it is a rule — after it, a posting whose *effective* date falls in
+on a report, it is a rule: after it, a posting whose *effective* date falls in
 that period is refused.
 
 That needs effective date to be a **separate column** from `created_at`. A
 backdated correction is January money recorded in February, and conflating the
-two means you can never backdate at all — which sounds safe and is exactly why
+two means you can never backdate at all, which sounds safe and is exactly why
 people post to the wrong period instead.
 
 The two policies for a late item are implemented separately and neither is the
 default: **restate** reopens January and changes a published number;
 **adjust forward** leaves January alone and books it in February. Reopening
-requires a named approver *and* a recorded reason — "reopened" with no reason is
+requires a named approver *and* a recorded reason: "reopened" with no reason is
 the audit-trail equivalent of no audit trail.
 
-**`ledger/reporting.py` — one number, and the residual it creates.** With EUR
+**`ledger/reporting.py`: one number, and the residual it creates.** With EUR
 and USD balances side by side there is no "total assets" until somebody names a
 rate. Consolidation needs **two**: closing for balance-sheet items, average for
 income-statement items. Translating revenue at the closing rate makes a month's
 earnings move because the currency moved on the last day.
 
 The residual between the two rates is the **cumulative translation adjustment**,
-and it belongs in equity rather than P&L — it is not a gain anybody realised.
+and it belongs in equity rather than P&L: it is not a gain anybody realised.
 **A consolidation reporting no CTA has almost certainly used one rate for
 everything**, so it is a named line and a test asserts a single-currency book
 produces exactly zero.
 
-**`ledger/adjustments.py` — authorizations that change size.** Hotels increment
+**`ledger/adjustments.py`: authorizations that change size.** Hotels increment
 for room service, fuel pumps adjust to the real amount, restaurants increment
 for the tip. Without this transition the workarounds are both wrong: void and
 re-authorize loses the original authorization date that the scheme's expiry
 clock runs from, and capturing the difference moves money before the stay ends.
 
-An adjustment is an authorize of a different size — the same two accounts,
-signed — so it never pays the merchant. The rule that matters: **a decrement can
+An adjustment is an authorize of a different size: the same two accounts,
+signed, so it never pays the merchant. The rule that matters: **a decrement can
 never go below what is already captured.** Partial capture makes that reachable
 (capture 80, decrement to 50, and the book says you hold less than you have paid
 out), and a test drives exactly that sequence.
@@ -324,7 +324,7 @@ remaining authorization to consume. Nothing about it looks wrong.
 
 ## What is NOT built
 
-1. ~~**Snapshot-backed balances on Postgres.**~~ **DONE** —
+1. ~~**Snapshot-backed balances on Postgres.**~~ **DONE**:
    `ledger/pg_snapshot.py`, `docs/PG_SNAPSHOTS.md`,
    `docs/PG_SNAPSHOT_READS.md`, `docs/PG_SNAPSHOT_STATS.md`, and seven tests in
    `tests/test_pg_snapshot.py`. Read cost against history depth, in buffers
@@ -336,7 +336,7 @@ remaining authorization to consume. Nothing about it looks wrong.
    | 200,000 | 7,480 buf | 16 buf |
 
    The scan grows 8.8× over that range and the snapshotted read does not grow
-   at all — **467× fewer buffers at 200,000 entries.** The write path is
+   at all: **467× fewer buffers at 200,000 entries.** The write path is
    untouched: `post()` passes straight through, because a checkpoint that
    changed the write path would hand back the contention the derived design
    was built to remove.
@@ -351,10 +351,10 @@ remaining authorization to consume. Nothing about it looks wrong.
    the delta query then skips that same entry for being *below* the watermark.
    It lands in neither half. Forced with two connections rather than raced:
    the checkpoint reports a balance **7,777 minor units short**, exactly the
-   lost entry, and nothing errors. Fixed by draining — wait until
+   lost entry, and nothing errors. Fixed by draining: wait until
    `pg_snapshot_xmin(pg_current_snapshot())` passes the `xmax` captured at
    watermark time, so every transaction that could still write below it has
-   ended — after which the same test reports a delta of 0.
+   ended, after which the same test reports a delta of 0.
 
    Two more things running it found, both of which argue against my own first
    answer:
@@ -363,7 +363,7 @@ remaining authorization to consume. Nothing about it looks wrong.
      entry for the account and discarded all 200,000 of them, touching the same
      2,029 buffers as the full scan it replaced. The answer was right, so no
      correctness test could see it. I diagnosed a missing index and added
-     `(account_id, id)`. **That was wrong** — isolating the causes shows a
+     `(account_id, id)`. **That was wrong**: isolating the causes shows a
      freshly bulk-loaded table simply has no statistics: 8,283 buffers before
      `ANALYZE`, 46 after, and with the composite index present the planner
      *still* picks `d_journal_entry_pkey` and never uses it. The index was
@@ -371,7 +371,7 @@ remaining authorization to consume. Nothing about it looks wrong.
      that does not exist. `docs/PG_SNAPSHOT_STATS.md` has the three-way table.
    - **A stale checkpoint that was silently trusted.** `DERIVED_SCHEMA`
      recreates the journal but not `d_balance_snapshot`, so checkpoints from a
-     previous run survived with watermarks above every live entry — the delta
+     previous run survived with watermarks above every live entry: the delta
      matched nothing and `balance()` returned the old total, **wrong by 5×**.
      Caught only because the benchmark asserts the checkpoint against a full
      scan on every step. `balance()` now raises `StaleSnapshot` rather than
@@ -383,7 +383,7 @@ remaining authorization to consume. Nothing about it looks wrong.
    a reasonable time; at 100K it would take hours on a hot account precisely
    because of item 1, so the number is still not claimed.
 3. ~~**A connection pool.**~~ **partly done, and it exposed a real bug.**
-   `Ledger` held a thread-local connection to `":memory:"` — which names a
+   `Ledger` held a thread-local connection to `":memory:"`, which names a
    database **private to the connection**, so every thread got its own EMPTY
    database. Thread A ran the schema; thread B opened a blank one with the same
    name. In-process tests never saw it because they build and use the Ledger on
@@ -394,12 +394,12 @@ remaining authorization to consume. Nothing about it looks wrong.
 
    Still per-thread rather than pooled, deliberately: a sqlite3 connection may
    not be shared across threads, and the interesting contention is the write
-   lock — a pool would queue on the same lock one step earlier and measure the
+   lock: a pool would queue on the same lock one step earlier and measure the
    queue instead of the database. Superseded note: `PgLedger` holds one
    connection per instance, which
    stands in for a pool at one connection per worker thread. A real service
    needs pgbouncer or an application pool with a sizing argument behind it.
-4. ~~**Idempotency on the HTTP capture and refund endpoints.**~~ **DONE** —
+4. ~~**Idempotency on the HTTP capture and refund endpoints.**~~ **DONE**,
    and the situation was backwards: `Idempotency-Key` was REQUIRED on
    `/postings` and absent from capture, refund and void, so the most dangerous
    endpoints were the only unprotected ones. Every capture used the hardcoded
@@ -408,7 +408,7 @@ remaining authorization to consume. Nothing about it looks wrong.
 
    All three now require the header, bind the payload to the key (409 on reuse
    with a different amount), and return `Idempotent-Replay`. `void` gained an
-   `idempotency_key` — it was the only one of the three without one, and "the
+   `idempotency_key`: it was the only one of the three without one, and "the
    state machine happens to reject the second call" is a different guarantee
    from "this is idempotent": the caller got a 422 for a retry that in fact
    succeeded. Verified over HTTP: a retried capture replays the same txn id and
@@ -416,17 +416,17 @@ remaining authorization to consume. Nothing about it looks wrong.
    functions take an `Idempotency-Key` now; `serve.py` exposes it only on
    `/payments/authorize`, so the guarantee is available to a library caller and
    not yet to an HTTP one.
-5. ~~**Rates from a source.**~~ **DONE** — `ledger/rates.py` is a rate STORE
+5. ~~**Rates from a source.**~~ **DONE**: `ledger/rates.py` is a rate STORE
    with the properties a consolidation actually needs: dated (a rate is a fact
    about an instant), **immutable once published** (a restatement is a new
    effective date, not an edit, or last quarter's report stops reproducing),
-   sourced (`ecb | provider | manual` — a manual override is legitimate and is
+   sourced (`ecb | provider | manual`: a manual override is legitimate and is
    the one an auditor asks about), Decimal-only enforced at the boundary, and it
    **raises on a missing rate** rather than defaulting to 1.0 or carrying the
    last one forward, either of which produces a consolidation that balances and
    is wrong.
 
-   `fetch_ecb` pulls real ECB reference rates and is explicit — never called at
+   `fetch_ecb` pulls real ECB reference rates and is explicit, never called at
    import or by a reporting run, because a consolidation whose numbers depend on
    whether a web request succeeded is not reproducible. It inverts EUR-per-unit
    to unit-per-EUR in one place, and labels the average as a stand-in because
@@ -435,7 +435,7 @@ remaining authorization to consume. Nothing about it looks wrong.
    declared inputs. Nothing fetches them, and nothing checks them against a
    published fixing -- a consolidation is only as good as the rate table
    somebody typed in.
-6. ~~**Scheme-specific adjustment rules.**~~ **DONE** — `ledger/schemes.py`,
+6. ~~**Scheme-specific adjustment rules.**~~ **DONE**: `ledger/schemes.py`,
    deliberately OUTSIDE the ledger. `adjust` enforces what is true of
    double-entry (a decrement may never fall below what is captured); this
    enforces what is true of Visa in 2026. A limit inside the ledger is a limit
@@ -443,7 +443,7 @@ remaining authorization to consume. Nothing about it looks wrong.
 
    Constraints by count, by cumulative ratio **against the ORIGINAL** (three 15%
    increments on a running total is 52%, not 45%), by MCC eligibility, and by an
-   expiry clock that runs from the original authorization — the rule most likely
+   expiry clock that runs from the original authorization: the rule most likely
    to be got wrong, and re-introducing it would undo what `adjustments.py`
    avoided by not re-authorizing. A scheme with no incremental support says so
    rather than being treated as a small limit. Limits are `ASSUMED_`, not
@@ -451,13 +451,13 @@ remaining authorization to consume. Nothing about it looks wrong.
    is there; the card
    networks each cap how many increments an authorization may take and how far
    it may grow, and none of that is modelled.
-7. ~~**Period close wired into `post()`.**~~ **DONE** — `Ledger.post` now calls
+7. ~~**Period close wired into `post()`.**~~ **DONE**: `Ledger.post` now calls
    `periods.guard` itself. "Available rather than enforced" is the same shape as
    every other bug this repo has found: a rule nothing calls is a rule that is
    not in effect.
 
    Two decisions came with it. An unstated `effective_on` defaults to **today**,
-   not to exempt — a posting with no stated date IS being made today, and
+   not to exempt: a posting with no stated date IS being made today, and
    treating the omission as exempt would make the guard optional by silence. And
    the period tables moved into `ledger/schema.sql`: a guard that queries a
    table which may not exist fails **open** on a fresh database, which is the
